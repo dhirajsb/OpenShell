@@ -126,7 +126,10 @@ async fn sandbox_mounts_enabled_driver_config_bind() {
         "type": "bind",
         "source": bind_source,
         "target": BIND_TARGET,
-        "read_only": false
+        "read_only": false,
+        // Relabel caller-owned bind data for container access on enforcing
+        // hosts. Shared labeling remains safe if another sandbox reuses it.
+        "selinux_label": "shared"
     });
     let driver_config = driver_config_mount_json(&driver, &bind_mount);
     // Host bind mounts are explicitly unsafe: this test validates driver mount
