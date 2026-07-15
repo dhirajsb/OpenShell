@@ -128,7 +128,19 @@ through the proposal loop instead of treating the denial as terminal.
    auto-rejects the older ones with reason `"superseded by chunk X"`. This
    gives the agent a refinement path (broad mechanistic L4 → narrow agent
    L7) without an explicit `supersedes_chunk_id` field.
-5. **Escalation.** Anything else lands in `pending` for human review.
+5. **Mechanistic dedup and self-reject.** Mechanistic submissions dedup on
+   `(host, port, binary)`: a repeat denial for an endpoint that already has a
+   draft row folds into that row (bumping `hit_count`) instead of creating a
+   new chunk. When the endpoint is already covered by a *different* approved
+   chunk, the redundant mechanistic submission self-rejects on arrival with
+   reason `"already covered by approved chunk X"`. This only ever acts on a
+   genuinely fresh, still-`pending` submission; it never rewrites the status
+   of an already-decided chunk. A dedup hit that resolves to an approved
+   row's own id leaves that chunk `approved` and merged — the self-reject
+   path does not un-merge a rule, so flipping an approved chunk to `rejected`
+   would leave the governance ledger disagreeing with the still-enforced
+   policy.
+6. **Escalation.** Anything else lands in `pending` for human review.
 
 ## What the prover decides
 
@@ -179,6 +191,10 @@ Sandbox events that represent observable behavior use OCSF structured logs:
 
 Use plain tracing for internal plumbing such as retries, debug state, and
 intermediate steps where the final observable event is logged separately.
+Forward-proxy success is a final observable event: emit it only after
+middleware, token grants, credential rewriting, policy-generation checks, and
+the HTTP relay have succeeded so a later denial cannot coexist with an allowed
+record for the same request.
 
 Never log secrets, credentials, bearer tokens, or query parameters in OCSF
 messages. OCSF JSONL output may be shipped to external systems.

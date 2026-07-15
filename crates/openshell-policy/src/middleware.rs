@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use openshell_core::middleware::{MAX_MIDDLEWARE_CONFIGS, MAX_MIDDLEWARE_SELECTOR_PATTERNS};
 use openshell_core::proto::{
     MiddlewareEndpointSelector, NetworkEndpoint, NetworkMiddlewareConfig, NetworkPolicyRule,
     SandboxPolicy,
@@ -169,13 +170,15 @@ where
         ..Default::default()
     };
     let mut violations = validate(&policy);
-    for middleware in &policy.network_middlewares {
-        let config = middleware.config.clone().unwrap_or_default();
-        if let Err(reason) = validate_config(&middleware.middleware, &config) {
-            violations.push(PolicyViolation::InvalidMiddlewareConfig {
-                name: middleware.name.clone(),
-                reason,
-            });
+    if policy.network_middlewares.len() <= MAX_MIDDLEWARE_CONFIGS {
+        for middleware in &policy.network_middlewares {
+            let config = middleware.config.clone().unwrap_or_default();
+            if let Err(reason) = validate_config(&middleware.middleware, &config) {
+                violations.push(PolicyViolation::InvalidMiddlewareConfig {
+                    name: middleware.name.clone(),
+                    reason,
+                });
+            }
         }
     }
     Ok(violations)
@@ -184,6 +187,12 @@ where
 pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
     let mut violations = Vec::new();
     let mut names = HashSet::new();
+
+    if policy.network_middlewares.len() > MAX_MIDDLEWARE_CONFIGS {
+        violations.push(PolicyViolation::TooManyMiddlewareConfigs {
+            count: policy.network_middlewares.len(),
+        });
+    }
 
     for middleware in &policy.network_middlewares {
         if middleware.name.is_empty() {
@@ -227,6 +236,17 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
                 reason: "endpoint selector must include at least one host pattern".to_string(),
             });
         }
+        let selector_patterns = selector
+            .include
+            .len()
+            .saturating_add(selector.exclude.len());
+        if selector_patterns > MAX_MIDDLEWARE_SELECTOR_PATTERNS {
+            violations.push(PolicyViolation::TooManyMiddlewareSelectorPatterns {
+                name: middleware.name.clone(),
+                count: selector_patterns,
+            });
+            continue;
+        }
         let mut selector_valid = !selector.include.is_empty();
         for pattern in selector.include.iter().chain(&selector.exclude) {
             if let Err(reason) = HostPattern::new(pattern) {
@@ -243,6 +263,7 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
             None
         };
 
+        let requires_inspection = matches!(middleware.on_error.as_str(), "" | "fail_closed");
         for (key, rule) in &policy.network_policies {
             let policy_name = if rule.name.is_empty() {
                 key
@@ -250,7 +271,8 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
                 &rule.name
             };
             for endpoint in &rule.endpoints {
-                let overlaps_tls_skip = endpoint.tls == "skip"
+                let overlaps_tls_skip = requires_inspection
+                    && endpoint.tls == "skip"
                     && compiled_selector.as_ref().is_some_and(|selector| {
                         HostPattern::new(&endpoint.host)
                             .is_ok_and(|endpoint| selector.may_match_pattern(&endpoint))

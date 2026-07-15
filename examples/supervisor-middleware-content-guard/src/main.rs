@@ -126,6 +126,7 @@ impl SupervisorMiddleware for ContentGuard {
                 operation: OPERATION as i32,
                 phase: PHASE as i32,
                 max_body_bytes: MAX_BODY_BYTES,
+                timeout: String::new(),
             }],
         }))
     }
@@ -221,7 +222,7 @@ fn evaluate(config: &GuardConfig, body: &str) -> HttpRequestResult {
             reason: String::new(),
             body: transformed.into_bytes(),
             has_body: true,
-            add_headers: HashMap::new(),
+            header_mutations: Vec::new(),
             findings: vec![finding],
             metadata,
         },
@@ -230,7 +231,7 @@ fn evaluate(config: &GuardConfig, body: &str) -> HttpRequestResult {
             reason: "request body matched configured content".into(),
             body: Vec::new(),
             has_body: false,
-            add_headers: HashMap::new(),
+            header_mutations: Vec::new(),
             findings: vec![finding],
             metadata,
         },
@@ -243,7 +244,7 @@ fn allow_result() -> HttpRequestResult {
         reason: String::new(),
         body: Vec::new(),
         has_body: false,
-        add_headers: HashMap::new(),
+        header_mutations: Vec::new(),
         findings: Vec::new(),
         metadata: HashMap::new(),
     }

@@ -142,8 +142,15 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
         // body. Apply each entry's `on_error` policy without buffering (an
         // unresolved binding is handled before the body is read) and forward
         // the original request unchanged if the chain allows.
-        let input =
-            middleware_request_input(scheme, &req, ctx, Vec::new(), String::new(), Vec::new());
+        let input = middleware_request_input(
+            scheme,
+            &req,
+            ctx,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+        );
         let outcome = runner.evaluate_described(&chain, input).await?;
         emit_middleware_events(ctx, &req, &outcome);
         return Ok(if outcome.allowed {
@@ -167,7 +174,15 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     };
     let headers = safe_middleware_headers(&buffered.headers)?;
     let query = raw_query_from_request_headers(&buffered.headers)?;
-    let input = middleware_request_input(scheme, &req, ctx, headers, query, buffered.body);
+    let input = middleware_request_input(
+        scheme,
+        &req,
+        ctx,
+        headers.visible,
+        headers.connection_nominated,
+        query,
+        buffered.body,
+    );
     // The explicitly selected transformation policy either re-checks every
     // replacement or documents that this protocol's policy is body-independent.
     // An ALLOW outcome therefore means the final body is policy-compliant.
@@ -182,7 +197,7 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
         &req,
         &buffered.headers,
         &outcome.body,
-        &outcome.added_headers,
+        &outcome.header_mutations,
     )?;
     Ok(MiddlewareApplyResult::Allowed(rebuilt))
 }
@@ -192,6 +207,7 @@ pub(super) fn middleware_request_input(
     req: &crate::l7::provider::L7Request,
     ctx: &L7EvalContext,
     headers: Vec<(String, String)>,
+    connection_nominated_headers: Vec<String>,
     query: String,
     body: Vec<u8>,
 ) -> openshell_supervisor_middleware::HttpRequestInput {
@@ -205,6 +221,7 @@ pub(super) fn middleware_request_input(
         path: req.target.clone(),
         query,
         headers,
+        connection_nominated_headers,
         body,
     }
 }
@@ -271,34 +288,61 @@ fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
 
 /// Parse the raw header block into middleware-visible headers, preserving
 /// wire order and repeated names so middleware inspects every value the
-/// upstream will receive. Credential-bearing headers are omitted.
-fn safe_middleware_headers(headers: &[u8]) -> Result<Vec<(String, String)>> {
+/// upstream will receive. Credential-bearing and hop-by-hop headers are
+/// omitted, while dynamically nominated names are retained separately for
+/// mutation validation.
+struct SafeMiddlewareHeaders {
+    visible: Vec<(String, String)>,
+    connection_nominated: Vec<String>,
+}
+
+fn safe_middleware_headers(headers: &[u8]) -> Result<SafeMiddlewareHeaders> {
+    crate::l7::rest::validate_http_request_header_block(headers)?;
     let header_str =
         std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
-    let mut out = Vec::new();
-    for line in header_str.lines().skip(1) {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let name = name.trim().to_ascii_lowercase();
-        if name.is_empty()
-            || matches!(
-                name.as_str(),
-                "authorization"
-                    | "proxy-authorization"
-                    | "cookie"
-                    | "host"
-                    | "content-length"
-                    | "transfer-encoding"
-            )
-            || name.starts_with("x-amz-")
-            || name.starts_with("x-openshell-credential")
-        {
-            continue;
-        }
-        out.push((name, value.trim().to_string()));
-    }
-    Ok(out)
+    let header_block = header_str
+        .strip_suffix("\r\n\r\n")
+        .expect("validated header block has terminator");
+    let connection_nominated = crate::l7::rest::connection_nominated_header_names(headers)?;
+
+    let visible = header_block
+        .split("\r\n")
+        .skip(1)
+        .map(|line| {
+            let (name, value) = line
+                .split_once(':')
+                .expect("validated header field contains colon");
+            (name.to_ascii_lowercase(), value.trim().to_string())
+        })
+        .filter(|(name, _)| {
+            !name.is_empty()
+                && !matches!(
+                    name.as_str(),
+                    "authorization"
+                        | "proxy-authorization"
+                        | "proxy-authenticate"
+                        | "cookie"
+                        | "host"
+                        | "content-length"
+                        | "transfer-encoding"
+                        | "connection"
+                        | "proxy-connection"
+                        | "keep-alive"
+                        | "te"
+                        | "trailer"
+                        | "upgrade"
+                )
+                && !name.starts_with("x-amz-")
+                && !name.starts_with("x-openshell-credential")
+                && !connection_nominated.contains(name)
+        })
+        .collect();
+    let mut connection_nominated: Vec<_> = connection_nominated.into_iter().collect();
+    connection_nominated.sort();
+    Ok(SafeMiddlewareHeaders {
+        visible,
+        connection_nominated,
+    })
 }
 
 pub fn middleware_network_input(ctx: &L7EvalContext) -> crate::opa::NetworkInput {
@@ -416,7 +460,14 @@ pub(super) fn middleware_events(
             .build();
         events.push(event);
     }
-    for finding in &outcome.findings {
+    // Each stage and the selected chain are independently bounded by the
+    // runner. Keep the derived chain-wide emission bound as defense in depth
+    // for manually constructed or future outcome producers.
+    for finding in outcome
+        .findings
+        .iter()
+        .take(openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_FINDINGS)
+    {
         let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
             .severity(match finding.finding.severity.as_str() {
                 "high" => SeverityId::High,
@@ -470,7 +521,7 @@ mod tests {
         .expect("headers should parse");
 
         assert_eq!(
-            headers,
+            headers.visible,
             vec![("x-request-id".to_string(), "request-123".to_string())]
         );
     }
@@ -490,12 +541,48 @@ mod tests {
         .expect("headers should parse");
 
         assert_eq!(
-            headers,
+            headers.visible,
             vec![
                 ("x-api-key".to_string(), "first-value".to_string()),
                 ("accept".to_string(), "application/json".to_string()),
                 ("x-api-key".to_string(), "second-value".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn middleware_headers_omit_standard_and_connection_nominated_hop_by_hop_fields() {
+        let headers = safe_middleware_headers(
+            b"GET /v1 HTTP/1.1\r\n\
+              X-Hop: secret-hop-value\r\n\
+              Connection: keep-alive, x-hop\r\n\
+              Keep-Alive: timeout=5\r\n\
+              TE: trailers\r\n\
+              Trailer: X-Checksum\r\n\
+              Upgrade: websocket\r\n\
+              X-Visible: visible-value\r\n\r\n",
+        )
+        .expect("headers should parse");
+
+        assert_eq!(
+            headers.visible,
+            vec![("x-visible".to_string(), "visible-value".to_string())]
+        );
+        assert_eq!(headers.connection_nominated, vec!["keep-alive", "x-hop"]);
+    }
+
+    #[test]
+    fn middleware_headers_reject_malformed_fields_instead_of_dropping_them() {
+        for headers in [
+            b"GET /v1 HTTP/1.1\r\nX-Test: first\r\n continued\r\n\r\n".as_slice(),
+            b"GET /v1 HTTP/1.1\r\nX-Test value\r\n\r\n".as_slice(),
+            b"GET /v1 HTTP/1.1\r\nX-Test : value\r\n\r\n".as_slice(),
+            b"GET /v1 HTTP/1.1\r\nX@Test: value\r\n\r\n".as_slice(),
+        ] {
+            assert!(
+                safe_middleware_headers(headers).is_err(),
+                "middleware must reject malformed header fields"
+            );
+        }
     }
 }

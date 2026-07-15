@@ -25,10 +25,11 @@ cargo run -- --bind 0.0.0.0:50051
 Add the service registration to your local gateway TOML:
 
 ```toml
-[[openshell.gateway.middleware]]
+[[openshell.supervisor.middleware]]
 name = "content-guard-example"
 grpc_endpoint = "http://host.openshell.internal:50051"
 max_body_bytes = 262144
+timeout = "500ms"
 ```
 
 The gateway calls `Describe` during startup and fails to start if the service is unavailable. Both the gateway and sandbox supervisors must resolve and reach the configured endpoint. Change the hostname when `host.openshell.internal` is not the shared host address for your local driver.
@@ -70,4 +71,4 @@ config:
     - prototype-secret
 ```
 
-The implementation supports only `HttpRequest/pre_credentials` and advertises a 256 KiB body limit. The gateway registration may set a smaller operator limit.
+The implementation supports only `HttpRequest/pre_credentials`, advertises a 256 KiB body limit, and inherits the service-wide RPC timeout. The gateway registration may set a smaller body limit. A binding can advertise a shorter timeout, but it cannot extend the operator-configured timeout.

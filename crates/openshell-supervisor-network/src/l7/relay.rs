@@ -1677,8 +1677,8 @@ pub(crate) fn l7_request_hard_deny_reason(
         .or_else(|| {
             request.jsonrpc.as_ref().and_then(|info| {
                 info.error
-                    .as_deref()
-                    .map(|error| format!("JSON-RPC request rejected: {error}"))
+                    .as_ref()
+                    .map(crate::l7::jsonrpc::JsonRpcInspectionError::rejection_reason)
                     .or_else(|| jsonrpc_response_frame_hard_deny_reason(protocol, info))
             })
         })
@@ -1932,6 +1932,27 @@ fn emit_transformed_body_decision(
     ocsf_emit!(event);
 }
 
+fn jsonrpc_policy_input(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> serde_json::Value {
+    let call = if info.is_batch {
+        None
+    } else {
+        info.calls.first()
+    };
+    serde_json::json!({
+        "method": call.map(|call| call.method.as_str()),
+        "params": call.map(|call| &call.params),
+        "tool": call.and_then(|call| call.tool.as_deref()),
+        "receive_stream": info.receive_stream,
+        "has_response": info.has_response,
+        // Rust keeps the inspection failure kind typed. Rego's stable boundary is
+        // still the original diagnostic string or null.
+        "error": info
+            .error
+            .as_ref()
+            .map(crate::l7::jsonrpc::JsonRpcInspectionError::detail),
+    })
+}
+
 fn evaluate_l7_request_once(
     engine: &TunnelPolicyEngine,
     ctx: &L7EvalContext,
@@ -1960,17 +1981,7 @@ fn evaluate_l7_request_once(
             "path": request.target,
             "query_params": request.query_params.clone(),
             "graphql": request.graphql.clone(),
-            "jsonrpc": request.jsonrpc.as_ref().map(|j| {
-                let call = if j.is_batch { None } else { j.calls.first() };
-                serde_json::json!({
-                    "method": call.map(|call| call.method.as_str()),
-                    "params": call.map(|call| &call.params),
-                    "tool": call.and_then(|call| call.tool.as_deref()),
-                    "receive_stream": j.receive_stream,
-                    "has_response": j.has_response,
-                    "error": j.error,
-                })
-            }),
+            "jsonrpc": request.jsonrpc.as_ref().map(jsonrpc_policy_input),
         }
     });
 
@@ -2666,7 +2677,7 @@ network_policies:
     #[tokio::test]
     async fn l7_rest_middleware_redacts_body_before_upstream() {
         let (config, tunnel_engine, ctx) =
-            middleware_relay_context("openshell/secrets", "fail_closed");
+            middleware_relay_context("openshell/regex", "fail_closed");
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
@@ -2724,7 +2735,7 @@ network_policies:
     #[tokio::test]
     async fn l7_rest_middleware_acknowledges_expect_continue_before_reading_body() {
         let (config, tunnel_engine, ctx) =
-            middleware_relay_context("openshell/secrets", "fail_closed");
+            middleware_relay_context("openshell/regex", "fail_closed");
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
@@ -2844,7 +2855,7 @@ network_policies:
         // still forwarded on an `enforcement: audit` endpoint when the
         // middleware chain is healthy and allows it.
         let (config, tunnel_engine, ctx) =
-            middleware_relay_context_with_enforcement("openshell/secrets", "fail_closed", "audit");
+            middleware_relay_context_with_enforcement("openshell/regex", "fail_closed", "audit");
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
@@ -3055,7 +3066,7 @@ network_policies:
     #[tokio::test]
     async fn l7_rest_middleware_over_capacity_fails_closed() {
         let (config, tunnel_engine, ctx) =
-            middleware_relay_context("openshell/secrets", "fail_closed");
+            middleware_relay_context("openshell/regex", "fail_closed");
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
@@ -3130,7 +3141,7 @@ network_policies:
         };
         let fail_open = ChainEntry {
             name: "m".into(),
-            implementation: "openshell/secrets".into(),
+            implementation: "openshell/regex".into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailOpen,
@@ -3175,7 +3186,7 @@ network_policies:
 
         let resolved = ChainEntry {
             name: "redact".into(),
-            implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailClosed,
@@ -3239,6 +3250,7 @@ network_policies:
                         phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials
                             as i32,
                         max_body_bytes: 8192,
+                        timeout: String::new(),
                     }],
                 },
             ))
@@ -3739,6 +3751,7 @@ network_policies:
                 operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                 max_body_bytes,
+                timeout: String::new(),
             };
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: "test/two-limits".into(),
@@ -3792,7 +3805,7 @@ network_policies:
         // guard is skipped through its own on_error, instead of the whole
         // chain taking the unbuffered over-capacity path.
         let (_config, tunnel_engine, ctx) =
-            middleware_relay_context("openshell/secrets", "fail_closed");
+            middleware_relay_context("openshell/regex", "fail_closed");
         let runner = ChainRunner::new(Arc::new(TwoLimitService));
         let chain = vec![
             ChainEntry {
@@ -3948,8 +3961,15 @@ network_policies:
             token_grant_resolver: None,
         };
 
-        let input =
-            middleware_request_input("http", &req, &ctx, Vec::new(), String::new(), Vec::new());
+        let input = middleware_request_input(
+            "http",
+            &req,
+            &ctx,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+        );
 
         assert_eq!(input.scheme, "http");
     }
@@ -3987,12 +4007,12 @@ network_policies:
             // The transformed body still holds the raw secret; emission must never
             // serialize it.
             body: format!(r#"{{"api_key":"{RAW_SECRET}"}}"#).into_bytes(),
-            added_headers: BTreeMap::new(),
+            header_mutations: Vec::new(),
             findings: vec![NamespacedFinding {
-                middleware: "redact-secrets".into(),
+                middleware: "regex-redactor".into(),
                 finding: openshell_core::proto::Finding {
-                    r#type: "secret.common".into(),
-                    label: "common secret pattern".into(),
+                    r#type: "regex.keyword".into(),
+                    label: "keyword regex match".into(),
                     count: 1,
                     confidence: "medium".into(),
                     severity: "medium".into(),
@@ -4000,8 +4020,8 @@ network_policies:
             }],
             metadata: BTreeMap::new(),
             applied: vec![MiddlewareInvocation {
-                name: "redact-secrets".into(),
-                implementation: "openshell/secrets".into(),
+                name: "regex-redactor".into(),
+                implementation: "openshell/regex".into(),
                 decision: openshell_core::proto::Decision::Allow,
                 transformed: true,
                 failed: false,
@@ -4033,13 +4053,51 @@ network_policies:
             "raw secret leaked into OCSF events: {serialized}"
         );
         // Safe finding metadata is still present.
-        assert!(serialized.contains("secret.common"));
+        assert!(serialized.contains("regex.keyword"));
+
+        let mut bounded_outcome = outcome;
+        bounded_outcome.findings = (0
+            ..openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES)
+            .flat_map(|stage| {
+                (0..openshell_supervisor_middleware::MAX_MIDDLEWARE_FINDINGS_PER_STAGE).map(
+                    move |_| NamespacedFinding {
+                        middleware: format!("external-guard-{stage}"),
+                        finding: openshell_core::proto::Finding {
+                            r#type: "example/content-guard.finding".into(),
+                            label: "External middleware finding".into(),
+                            count: 1,
+                            confidence: String::new(),
+                            severity: "medium".into(),
+                        },
+                    },
+                )
+            })
+            .chain(std::iter::once(NamespacedFinding {
+                middleware: "over-capacity".into(),
+                finding: openshell_core::proto::Finding {
+                    r#type: "example/content-guard.finding".into(),
+                    label: "External middleware finding".into(),
+                    count: 1,
+                    confidence: String::new(),
+                    severity: "medium".into(),
+                },
+            }))
+            .collect();
+        let bounded_events = middleware_events(&ctx, &req, &bounded_outcome);
+        assert_eq!(
+            bounded_events
+                .iter()
+                .filter(|event| event.class_uid() == 2004)
+                .count(),
+            openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_FINDINGS,
+            "finding emission must remain bounded even if an invalid outcome bypasses the runner"
+        );
 
         let denied_outcome = ChainOutcome {
             allowed: false,
             reason: "request matched configured policy".into(),
             body: Vec::new(),
-            added_headers: BTreeMap::new(),
+            header_mutations: Vec::new(),
             findings: Vec::new(),
             metadata: BTreeMap::new(),
             applied: vec![MiddlewareInvocation {
@@ -4068,6 +4126,19 @@ network_policies:
              [policy:rest_api engine:middleware] \
              [failed:false transformed:false reason:request matched configured policy]"
         );
+
+        let external_failure_outcome = ChainOutcome {
+            reason: "middleware_failed: header_mutation_invalid_name".into(),
+            applied: vec![MiddlewareInvocation {
+                failed: true,
+                ..denied_outcome.applied[0].clone()
+            }],
+            ..denied_outcome
+        };
+        let failure_events = middleware_events(&ctx, &req, &external_failure_outcome);
+        let serialized = serde_json::to_string(&failure_events).expect("serialize failure events");
+        assert!(serialized.contains("header_mutation_invalid_name"));
+        assert!(!serialized.contains(RAW_SECRET));
     }
 
     #[tokio::test]
@@ -4077,7 +4148,7 @@ network_policies:
         let data = r#"
 network_middlewares:
   - name: request-middleware
-    middleware: openshell/secrets
+    middleware: openshell/regex
     on_error: fail_closed
     endpoints:
       include: ["api.example.test"]
@@ -4446,6 +4517,32 @@ network_policies:
 
         assert!(!allowed);
         assert!(reason.contains("WEBSOCKET_TEXT /ws not permitted"));
+    }
+
+    #[test]
+    fn jsonrpc_inspection_error_opa_projection_remains_string_or_null() {
+        let invalid_json = crate::l7::jsonrpc::parse_jsonrpc_body(
+            b"{",
+            crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
+        );
+        let invalid_message = crate::l7::jsonrpc::parse_jsonrpc_body(
+            br#"{"id":1,"method":"reports.list"}"#,
+            crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
+        );
+        let accepted = crate::l7::jsonrpc::parse_jsonrpc_body(
+            br#"{"jsonrpc":"2.0","id":1,"method":"reports.list"}"#,
+            crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
+        );
+
+        assert_eq!(
+            jsonrpc_policy_input(&invalid_json)["error"],
+            serde_json::json!("invalid JSON")
+        );
+        assert_eq!(
+            jsonrpc_policy_input(&invalid_message)["error"],
+            serde_json::json!("missing or non-string 'jsonrpc' field")
+        );
+        assert!(jsonrpc_policy_input(&accepted)["error"].is_null());
     }
 
     #[test]

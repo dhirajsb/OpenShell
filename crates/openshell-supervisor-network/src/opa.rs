@@ -883,6 +883,12 @@ fn global_middleware_entries(configs: &[regorus::Value], host: &str) -> Result<V
     let mut entries = Vec::new();
     for config in configs {
         if middleware_selector_matches(config, host)? {
+            if entries.len() >= openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES {
+                return Err(miette::miette!(
+                    "selected middleware stage count exceeds platform maximum {}",
+                    openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES
+                ));
+            }
             entries.push(chain_entry_from_value(config)?);
         }
     }
@@ -6631,8 +6637,8 @@ network_policies:
         assert!(engine.evaluate_network(&python_input).unwrap().allowed);
 
         let entry = ChainEntry {
-            name: "secrets".into(),
-            implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+            name: "regex".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: openshell_supervisor_middleware::OnError::FailClosed,
@@ -6693,8 +6699,8 @@ network_policies:
         assert!(engine.evaluate_network(&python_input).unwrap().allowed);
 
         let entry = ChainEntry {
-            name: "secrets".into(),
-            implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+            name: "regex".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: openshell_supervisor_middleware::OnError::FailClosed,
@@ -6725,7 +6731,7 @@ network_policies:
         let mut invalid = proto;
         invalid.network_middlewares.push(NetworkMiddlewareConfig {
             name: String::new(),
-            middleware: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+            middleware: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             ..Default::default()
         });
         let empty_registry = MiddlewareRegistry::connect_services(Vec::new(), Vec::new())
@@ -6748,8 +6754,8 @@ network_policies:
         assert!(engine.evaluate_network(&claude_input).unwrap().allowed);
 
         let entry = ChainEntry {
-            name: "secrets".into(),
-            implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+            name: "regex".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: openshell_supervisor_middleware::OnError::FailClosed,
@@ -7106,17 +7112,17 @@ network_policies:
         let data = r#"
 network_middlewares:
   - name: global-redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     order: 20
     endpoints:
       include: ["api.example.com"]
   - name: policy-redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     order: 10
     endpoints:
       include: ["api.example.com"]
   - name: endpoint-redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     order: 10
     endpoints:
       include: ["api.example.com"]
@@ -7152,23 +7158,64 @@ network_policies:
         );
     }
 
+    fn matching_middleware_configs(count: usize) -> Vec<regorus::Value> {
+        (0..count)
+            .map(|index| {
+                regorus::Value::from(serde_json::json!({
+                    "name": format!("stage-{index}"),
+                    "middleware": "openshell/regex",
+                    "endpoints": {"include": ["api.example.com"]}
+                }))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn middleware_chain_accepts_maximum_selected_stages() {
+        let configs = matching_middleware_configs(
+            openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES,
+        );
+
+        let chain =
+            global_middleware_entries(&configs, "api.example.com").expect("maximum selected chain");
+        assert_eq!(
+            chain.len(),
+            openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES
+        );
+    }
+
+    #[test]
+    fn middleware_chain_rejects_selected_stages_over_capacity() {
+        let configs = matching_middleware_configs(
+            openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES + 1,
+        );
+
+        let error = global_middleware_entries(&configs, "api.example.com")
+            .expect_err("selected chain over capacity");
+        assert!(
+            error
+                .to_string()
+                .contains("selected middleware stage count exceeds platform maximum 10")
+        );
+    }
+
     #[test]
     fn middleware_chain_uses_dns_label_glob_semantics() {
         let data = r#"
 network_middlewares:
   - name: single-label
-    middleware: openshell/secrets
+    middleware: openshell/regex
     order: 10
     endpoints:
       include: ["*.Example.COM"]
       exclude: ["trusted.example.com"]
   - name: recursive
-    middleware: openshell/secrets
+    middleware: openshell/regex
     order: 20
     endpoints:
       include: ["**.example.com"]
   - name: intra-label
-    middleware: openshell/secrets
+    middleware: openshell/regex
     order: 30
     endpoints:
       include: ["*-api.example.com"]
@@ -7278,7 +7325,7 @@ host_match if {
                 r#"
 network_middlewares:
   - name: redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     on_error: maybe
     endpoints:
       include: ["api.example.com"]
@@ -7290,11 +7337,11 @@ network_middlewares:
                 r#"
 network_middlewares:
   - name: redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     endpoints:
       include: ["api.example.com"]
   - name: redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     endpoints:
       include: ["api.example.com"]
 "#,
@@ -7305,7 +7352,7 @@ network_middlewares:
                 r#"
 network_middlewares:
   - name: redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
 "#,
                 "endpoint selector is required",
             ),
@@ -7314,7 +7361,7 @@ network_middlewares:
                 r#"
 network_middlewares:
   - name: redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     endpoints:
       include: ["api[.example.com"]
 "#,
@@ -7325,7 +7372,7 @@ network_middlewares:
                 r#"
 network_middlewares:
   - name: redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     endpoints:
       include: ["api.example.com"]
 network_policies:
@@ -7344,7 +7391,7 @@ network_policies:
                 r#"
 network_middlewares:
   - name: redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     endpoints:
       include: ["api.example.com"]
 network_policies:
@@ -7391,17 +7438,17 @@ network_middlewares:
                 "not a registered OpenShell built-in",
             ),
             (
-                "invalid secrets config",
+                "invalid regex config",
                 r#"
 network_middlewares:
   - name: redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     config:
-      secrets: allow
+      mode: allow
     endpoints:
       include: ["api.example.com"]
 "#,
-                "supports only secrets: redact",
+                "supports only mode: redact",
             ),
         ] {
             let error =
@@ -7421,7 +7468,7 @@ network_middlewares:
         let mut policy = openshell_policy::restrictive_default_policy();
         policy.network_middlewares.push(NetworkMiddlewareConfig {
             name: "redactor".into(),
-            middleware: "openshell/secrets".into(),
+            middleware: "openshell/regex".into(),
             endpoints: Some(openshell_core::proto::MiddlewareEndpointSelector {
                 include: vec!["api[.example.com".into()],
                 exclude: Vec::new(),

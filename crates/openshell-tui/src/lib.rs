@@ -142,8 +142,7 @@ pub async fn run(
                 }
                 if app.pending_shell_connect {
                     app.pending_shell_connect = false;
-                    handle_shell_connect(&mut app, &mut terminal, &events).await;
-                    refresh_data(&mut app).await;
+                    handle_shell_connect(&mut app, &mut terminal, &mut events).await?;
                 }
                 // --- Draft actions ---
                 if app.pending_draft_approve {
@@ -366,11 +365,11 @@ pub async fn run(
                                     handle_exec_command(
                                         &mut app,
                                         &mut terminal,
-                                        &events,
+                                        &mut events,
                                         &name,
                                         &command,
                                     )
-                                    .await;
+                                    .await?;
                                 }
                             }
                             Some(Err(msg)) => {
@@ -841,11 +840,11 @@ async fn fetch_sandbox_detail(app: &mut App) {
 async fn handle_shell_connect(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    events: &EventHandler,
-) {
+    events: &mut EventHandler,
+) -> Result<()> {
     let sandbox_name = match app.selected_sandbox_name() {
         Some(n) => n.to_string(),
-        None => return,
+        None => return Ok(()),
     };
 
     // Step 1: Get sandbox ID.
@@ -859,16 +858,16 @@ async fn handle_shell_connect(
                     s.object_id().to_string()
                 } else {
                     app.status_text = "sandbox not found".to_string();
-                    return;
+                    return Ok(());
                 }
             }
             Ok(Err(e)) => {
                 app.status_text = format!("failed to get sandbox: {}", e.message());
-                return;
+                return Ok(());
             }
             Err(_) => {
                 app.status_text = "get sandbox timed out".to_string();
-                return;
+                return Ok(());
             }
         }
     };
@@ -883,17 +882,17 @@ async fn handle_shell_connect(
             Ok(Ok(resp)) => resp.into_inner(),
             Ok(Err(e)) => {
                 app.status_text = format!("SSH session failed: {}", e.message());
-                return;
+                return Ok(());
             }
             Err(_) => {
                 app.status_text = "SSH session request timed out".to_string();
-                return;
+                return Ok(());
             }
         }
     };
     if let Err(err) = validate_ssh_session_response(&session) {
         app.status_text = format!("gateway returned invalid SSH session response: {err}");
-        return;
+        return Ok(());
     }
 
     // Step 3: Resolve gateway address (handle loopback override).
@@ -908,7 +907,7 @@ async fn handle_shell_connect(
         Ok(p) => p,
         Err(e) => {
             app.status_text = format!("failed to find executable: {e}");
-            return;
+            return Ok(());
         }
     };
     let proxy_command = build_proxy_command(
@@ -948,12 +947,13 @@ async fn handle_shell_connect(
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Step 7: Suspend TUI — leave alternate screen, disable raw mode.
-    let _ = execute!(
+    execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
-    );
-    let _ = disable_raw_mode();
+    )
+    .into_diagnostic()?;
+    disable_raw_mode().into_diagnostic()?;
 
     // Step 8: Spawn SSH as child process and wait.
     let status = tokio::task::spawn_blocking(move || command.status()).await;
@@ -972,15 +972,22 @@ async fn handle_shell_connect(
         }
     }
 
-    // Step 9: Resume TUI — re-enter alternate screen, enable raw mode, unpause events.
-    let _ = enable_raw_mode();
-    let _ = execute!(
+    // Step 9: Resume and draw the TUI before accepting new terminal input.
+    enable_raw_mode().into_diagnostic()?;
+    execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
         EnableMouseCapture
-    );
-    let _ = terminal.clear();
+    )
+    .into_diagnostic()?;
+    terminal.clear().into_diagnostic()?;
+    terminal
+        .draw(|frame| ui::draw(frame, app))
+        .into_diagnostic()?;
+    events.discard_pending();
     events.resume();
+
+    Ok(())
 }
 
 /// Suspend the TUI, execute a command on a sandbox via SSH, then resume.
@@ -991,10 +998,10 @@ async fn handle_shell_connect(
 async fn handle_exec_command(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    events: &EventHandler,
+    events: &mut EventHandler,
     sandbox_name: &str,
     command: &str,
-) {
+) -> Result<()> {
     // Step 1: Resolve sandbox → SSH session (same as handle_shell_connect).
     let sandbox_id = {
         let req = openshell_core::proto::GetSandboxRequest {
@@ -1006,16 +1013,16 @@ async fn handle_exec_command(
                     s.object_id().to_string()
                 } else {
                     app.status_text = format!("exec: sandbox {sandbox_name} not found");
-                    return;
+                    return Ok(());
                 }
             }
             Ok(Err(e)) => {
                 app.status_text = format!("exec: failed to get sandbox: {}", e.message());
-                return;
+                return Ok(());
             }
             Err(_) => {
                 app.status_text = "exec: get sandbox timed out".to_string();
-                return;
+                return Ok(());
             }
         }
     };
@@ -1029,17 +1036,17 @@ async fn handle_exec_command(
             Ok(Ok(resp)) => resp.into_inner(),
             Ok(Err(e)) => {
                 app.status_text = format!("exec: SSH session failed: {}", e.message());
-                return;
+                return Ok(());
             }
             Err(_) => {
                 app.status_text = "exec: SSH session timed out".to_string();
-                return;
+                return Ok(());
             }
         }
     };
     if let Err(err) = validate_ssh_session_response(&session) {
         app.status_text = format!("exec: gateway returned invalid SSH session response: {err}");
-        return;
+        return Ok(());
     }
 
     // Step 2: Resolve gateway and build ProxyCommand (same as handle_shell_connect).
@@ -1053,7 +1060,7 @@ async fn handle_exec_command(
         Ok(p) => p,
         Err(e) => {
             app.status_text = format!("exec: failed to find executable: {e}");
-            return;
+            return Ok(());
         }
     };
     let proxy_command = build_proxy_command(
@@ -1099,12 +1106,13 @@ async fn handle_exec_command(
     events.pause();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let _ = execute!(
+    execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
-    );
-    let _ = disable_raw_mode();
+    )
+    .into_diagnostic()?;
+    disable_raw_mode().into_diagnostic()?;
 
     // Step 5: Run command — blocks until user Ctrl-C's or command exits.
     let status = tokio::task::spawn_blocking(move || ssh.status()).await;
@@ -1124,14 +1132,18 @@ async fn handle_exec_command(
     }
 
     // Step 6: Resume TUI.
-    let _ = enable_raw_mode();
-    let _ = execute!(
+    enable_raw_mode().into_diagnostic()?;
+    execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
         EnableMouseCapture
-    );
-    let _ = terminal.clear();
+    )
+    .into_diagnostic()?;
+    terminal.clear().into_diagnostic()?;
+    events.discard_pending();
     events.resume();
+
+    Ok(())
 }
 
 // SSH utility functions are shared via openshell_core::forward.
@@ -1367,6 +1379,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                 ..Default::default()
             }),
             labels: HashMap::new(),
+            annotations: HashMap::new(),
         };
 
         let sandbox_name =
@@ -1631,6 +1644,7 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                         created_at_ms: 0,
                         labels: HashMap::new(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                     }),
                     r#type: ptype.clone(),
                     credentials: credentials.clone(),
@@ -1723,6 +1737,7 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: ptype,
                 credentials,
@@ -2092,13 +2107,10 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let req = UpdateConfigRequest {
             name: String::new(),
-            policy: None,
             setting_key: key,
             setting_value: Some(SettingValue { value: Some(value) }),
-            delete_setting: false,
             global: true,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2128,13 +2140,10 @@ fn spawn_delete_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let req = UpdateConfigRequest {
             name: String::new(),
-            policy: None,
             setting_key: key,
-            setting_value: None,
             delete_setting: true,
             global: true,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2198,13 +2207,9 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let req = UpdateConfigRequest {
             name,
-            policy: None,
             setting_key: key,
             setting_value: Some(SettingValue { value: Some(value) }),
-            delete_setting: false,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2238,13 +2243,9 @@ fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let req = UpdateConfigRequest {
             name,
-            policy: None,
             setting_key: key,
-            setting_value: None,
             delete_setting: true,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2359,6 +2360,16 @@ async fn refresh_sandboxes(app: &mut App) {
                     s.object_labels()
                         .as_ref()
                         .map(app::format_labels)
+                        .unwrap_or_default()
+                })
+                .collect();
+
+            app.sandbox_annotations = sandboxes
+                .iter()
+                .map(|s| {
+                    s.metadata
+                        .as_ref()
+                        .map(|metadata| app::format_annotations(&metadata.annotations))
                         .unwrap_or_default()
                 })
                 .collect();

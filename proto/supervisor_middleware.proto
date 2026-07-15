@@ -45,6 +45,12 @@ message MiddlewareBinding {
   SupervisorMiddlewarePhase phase = 3;
   // Maximum request or replacement body this binding can process.
   uint64 max_body_bytes = 4;
+  // Optional binding-specific RPC timeout. Empty uses the operator-configured
+  // service timeout, or the 500ms platform default when that is also omitted.
+  // A non-empty value may shorten but cannot extend the operator timeout.
+  // Values use an integer with an `ms` or `s` suffix and must be between
+  // 10ms and 30s.
+  string timeout = 5;
 }
 
 // ValidateConfigRequest contains one policy configuration to validate.
@@ -70,17 +76,20 @@ message HttpRequestEvaluation {
   // Evaluation phase selected for this request.
   SupervisorMiddlewarePhase phase = 2;
   // Sandbox and request identity available to the supervisor.
+  // The encoded context is limited to 4 KiB.
   RequestContext context = 3;
   // Validated service-specific policy configuration.
+  // The encoded configuration is limited to 64 KiB.
   google.protobuf.Struct config = 4;
   // Destination and HTTP request target.
+  // The encoded target is limited to 32 KiB.
   HttpRequestTarget target = 5;
   // HTTP request headers before OpenShell injects credentials, in wire
-  // order. Repeated header names are preserved as separate entries so a
-  // service inspects every value the upstream will receive. Protected
-  // headers such as authorization or cookie are omitted.
+  // order. Repeated header names are preserved as separate entries. Protected
+  // credential, routing, framing, and hop-by-hop headers are omitted.
+  // At most 128 lines and 64 KiB of encoded headers are included.
   repeated HttpHeader headers = 6;
-  // Buffered request body. Empty for a bodyless request.
+  // Buffered request body, limited to 4 MiB. Empty for a bodyless request.
   bytes body = 7;
 }
 
@@ -164,27 +173,66 @@ message Finding {
   string severity = 5;
 }
 
+// ExistingHeaderAction controls how a header write behaves when the
+// case-insensitive header name is already present. Every action writes the
+// value when the header is absent.
+enum ExistingHeaderAction {
+  EXISTING_HEADER_ACTION_UNSPECIFIED = 0;
+  // Add another field value without changing existing values.
+  EXISTING_HEADER_ACTION_APPEND = 1;
+  // Remove every existing value, then add the new value.
+  EXISTING_HEADER_ACTION_OVERWRITE = 2;
+  // Leave the existing values unchanged.
+  EXISTING_HEADER_ACTION_SKIP = 3;
+}
+
+// WriteHeader proposes one header value and defines collision behavior.
+message WriteHeader {
+  string name = 1;
+  string value = 2;
+  ExistingHeaderAction on_existing = 3;
+}
+
+// RemoveHeader removes every value for a case-insensitive header name.
+message RemoveHeader {
+  string name = 1;
+}
+
+// HeaderMutation is one ordered request-header operation.
+message HeaderMutation {
+  oneof operation {
+    WriteHeader write = 1;
+    RemoveHeader remove = 2;
+  }
+}
+
 // HttpRequestResult contains the decision and optional request mutations.
 message HttpRequestResult {
   // Allow or deny decision for this request.
   Decision decision = 1;
-  // Audit-safe human-readable reason used for diagnostics, denied responses,
-  // and security logs. Must not contain request content, configured terms,
-  // credentials, or other secrets.
+  // Audit-safe human-readable reason. OpenShell does not relay text from an
+  // operator-run service into denied responses or security logs. Limited to
+  // 4 KiB before normalization.
   string reason = 2;
-  // Replacement request body when has_body is true.
+  // Replacement request body when has_body is true. Limited to 4 MiB.
   bytes body = 3;
   // True when body should replace the request body, including with an empty body.
   bool has_body = 4;
-  // Request headers to add before forwarding. Only new headers whose
-  // case-insensitive names start with "x-openshell-middleware-" are accepted.
-  // Existing request headers cannot be rewritten, protected headers such as
-  // authorization or transfer-encoding are always rejected, and values must
-  // not contain control characters. A violating result is a middleware
-  // failure handled according to the policy failure mode.
-  map<string, string> add_headers = 5;
-  // Audit-safe findings produced during evaluation.
+  // Ordered request-header mutations applied before the next middleware and
+  // before forwarding. Header writes are restricted to the
+  // "x-openshell-middleware-" namespace. Removes may target other visible
+  // request headers, but credential, routing, framing, and hop-by-hop headers
+  // are always protected. A violating result is a middleware failure handled
+  // according to the policy failure mode. At most 64 operations, 32 KiB of
+  // validated name/value data, and 64 KiB encoded are accepted.
+  repeated HeaderMutation header_mutations = 5;
+  // Audit-safe findings produced during evaluation. For operator-run services,
+  // OpenShell logs platform-owned fields derived from the validated binding id
+  // rather than service-provided type, label, confidence, or metadata text.
+  // At most 32 findings of at most 4 KiB encoded each are accepted per stage.
+  // A policy selects at most 10 stages, so one chain retains at most 320.
   repeated Finding findings = 6;
-  // Non-secret service-defined metadata included in diagnostics.
+  // Non-secret service-defined metadata included in diagnostics. At most 64
+  // entries and 32 KiB of combined key/value data are accepted.
   map<string, string> metadata = 7;
 }

@@ -3,26 +3,85 @@
 
 //! Supervisor middleware registration and chain execution.
 
+mod headers;
 mod remote;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use miette::{Result, miette};
+use prost::Message;
 
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, Finding, HttpHeader, HttpRequestEvaluation, HttpRequestTarget, MiddlewareBinding,
-    MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
+    Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestTarget,
+    MiddlewareBinding, MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
     ValidateConfigRequest,
 };
 use tokio::sync::OnceCell;
 use tonic::Request;
 
+pub use openshell_core::middleware::{
+    DEFAULT_MIDDLEWARE_TIMEOUT, MAX_MIDDLEWARE_CHAIN_FINDINGS, MAX_MIDDLEWARE_CHAIN_STAGES,
+    MAX_MIDDLEWARE_CONFIGS, MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_SELECTOR_PATTERNS,
+    MAX_MIDDLEWARE_TIMEOUT, MIN_MIDDLEWARE_TIMEOUT, middleware_timeout_or_default,
+    parse_middleware_timeout,
+};
+
+/// Largest request or replacement body accepted by the middleware platform.
+pub const MAX_MIDDLEWARE_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Largest encoded service-specific configuration attached to one evaluation.
+pub const MAX_MIDDLEWARE_CONFIG_BYTES: usize = 64 * 1024;
+/// Largest encoded request identity context attached to one evaluation.
+pub const MAX_MIDDLEWARE_CONTEXT_BYTES: usize = 4 * 1024;
+/// Largest encoded destination and request target attached to one evaluation.
+pub const MAX_MIDDLEWARE_TARGET_BYTES: usize = 32 * 1024;
+/// Largest number of request header lines exposed to one middleware.
+pub const MAX_MIDDLEWARE_HEADERS: usize = 128;
+/// Largest encoded request header collection exposed to one middleware.
+pub const MAX_MIDDLEWARE_HEADER_BYTES: usize = 64 * 1024;
+/// Largest operator-provided reason accepted in one middleware result.
+pub const MAX_MIDDLEWARE_REASON_BYTES: usize = 4 * 1024;
+/// Largest encoded individual finding accepted from one middleware stage.
+pub const MAX_MIDDLEWARE_FINDING_BYTES: usize = 4 * 1024;
+/// Largest number of metadata entries accepted from one middleware stage.
+pub const MAX_MIDDLEWARE_METADATA_ENTRIES: usize = 64;
+/// Largest combined metadata key/value payload accepted from one middleware stage.
+pub const MAX_MIDDLEWARE_METADATA_BYTES: usize = 32 * 1024;
+
+const MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES: usize = 64 * 1024;
+const MAX_MIDDLEWARE_PROTOBUF_OVERHEAD_BYTES: usize = 64 * 1024;
+const MAX_MIDDLEWARE_REQUEST_ENVELOPE_BYTES: usize = MAX_MIDDLEWARE_CONFIG_BYTES
+    + MAX_MIDDLEWARE_CONTEXT_BYTES
+    + MAX_MIDDLEWARE_TARGET_BYTES
+    + MAX_MIDDLEWARE_HEADER_BYTES
+    + MAX_MIDDLEWARE_PROTOBUF_OVERHEAD_BYTES;
+const MAX_MIDDLEWARE_RESPONSE_ENVELOPE_BYTES: usize = MAX_MIDDLEWARE_REASON_BYTES
+    + MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES
+    + MAX_MIDDLEWARE_FINDINGS_PER_STAGE * MAX_MIDDLEWARE_FINDING_BYTES
+    + MAX_MIDDLEWARE_METADATA_BYTES
+    + MAX_MIDDLEWARE_PROTOBUF_OVERHEAD_BYTES;
+/// gRPC envelope headroom derived from every bounded non-body component.
+pub const MIDDLEWARE_GRPC_ENVELOPE_BYTES: usize =
+    if MAX_MIDDLEWARE_REQUEST_ENVELOPE_BYTES > MAX_MIDDLEWARE_RESPONSE_ENVELOPE_BYTES {
+        MAX_MIDDLEWARE_REQUEST_ENVELOPE_BYTES
+    } else {
+        MAX_MIDDLEWARE_RESPONSE_ENVELOPE_BYTES
+    };
+/// gRPC message limit derived from the body and bounded protobuf components.
+pub const MIDDLEWARE_GRPC_MESSAGE_BYTES: usize =
+    MAX_MIDDLEWARE_BODY_BYTES + MIDDLEWARE_GRPC_ENVELOPE_BYTES;
+
 const HTTP_REQUEST_OPERATION: SupervisorMiddlewareOperation =
     SupervisorMiddlewareOperation::HttpRequest;
 const PRE_CREDENTIALS_PHASE: SupervisorMiddlewarePhase = SupervisorMiddlewarePhase::PreCredentials;
+const MAX_STABLE_IDENTIFIER_BYTES: usize = 128;
+const EXTERNAL_FINDING_LABEL: &str = "External middleware finding";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnError {
     FailClosed,
@@ -82,6 +141,7 @@ pub struct DescribedChainEntry {
     service: Option<Arc<MiddlewareServiceState>>,
     binding: Option<MiddlewareBinding>,
     max_body_bytes: usize,
+    timeout: Duration,
 }
 
 impl DescribedChainEntry {
@@ -91,6 +151,10 @@ impl DescribedChainEntry {
 
     pub fn on_error(&self) -> OnError {
         self.entry.on_error
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// True when this entry resolved to a registered binding and will be
@@ -138,6 +202,10 @@ pub struct HttpRequestInput {
     /// preserved as separate entries so middleware inspects every value the
     /// upstream will receive.
     pub headers: Vec<(String, String)>,
+    /// Lowercased names nominated by the original request's `Connection`
+    /// headers. Their values are not exposed to middleware, but mutations must
+    /// still treat these dynamically hop-by-hop fields as protected.
+    pub connection_nominated_headers: Vec<String>,
     pub body: Vec<u8>,
 }
 
@@ -146,7 +214,8 @@ pub struct ChainOutcome {
     pub allowed: bool,
     pub reason: String,
     pub body: Vec<u8>,
-    pub added_headers: BTreeMap<String, String>,
+    /// Ordered, validated mutations to replay against the original raw request.
+    pub header_mutations: Vec<HeaderMutation>,
     pub findings: Vec<NamespacedFinding>,
     pub metadata: BTreeMap<String, BTreeMap<String, String>>,
     pub applied: Vec<MiddlewareInvocation>,
@@ -216,7 +285,68 @@ pub struct ChainRunner {
 struct MiddlewareServiceState {
     service: Arc<dyn SupervisorMiddleware>,
     manifest: OnceCell<MiddlewareManifest>,
+    diagnostic_policy: MiddlewareDiagnosticPolicy,
     operator_max_body_bytes: Option<usize>,
+    operator_timeout: Duration,
+}
+
+impl MiddlewareServiceState {
+    fn timeout_for_binding(&self, binding: &MiddlewareBinding) -> Result<Duration> {
+        if binding.timeout.trim().is_empty() {
+            Ok(self.operator_timeout)
+        } else {
+            parse_middleware_timeout(&binding.timeout)
+                .map(|binding_timeout| binding_timeout.min(self.operator_timeout))
+                .map_err(|reason| {
+                    miette!(
+                        "middleware binding '{}' has invalid timeout: {reason}",
+                        binding.id
+                    )
+                })
+        }
+    }
+}
+
+async fn call_with_timeout<T>(
+    timeout: Duration,
+    operation: &'static str,
+    future: impl Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+) -> std::result::Result<tonic::Response<T>, tonic::Status> {
+    tokio::time::timeout(timeout, future).await.map_err(|_| {
+        tonic::Status::deadline_exceeded(format!("middleware {operation} timed out"))
+    })?
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MiddlewareDiagnosticPolicy {
+    Preserve,
+    Normalize,
+}
+
+impl MiddlewareDiagnosticPolicy {
+    fn error_reason(self, error: &tonic::Status) -> String {
+        match self {
+            Self::Preserve => safe_reason(&error.to_string()),
+            Self::Normalize => "external_service_error".to_string(),
+        }
+    }
+
+    fn process_result(
+        self,
+        binding: &MiddlewareBinding,
+        result: &mut openshell_core::proto::HttpRequestResult,
+    ) {
+        if self == Self::Normalize {
+            normalize_untrusted_diagnostics(binding, result);
+        }
+    }
+
+    fn header_mutation_error_reason(self, error: &headers::HeaderMutationError) -> String {
+        match self {
+            Self::Preserve => safe_reason(&error.to_string()),
+            Self::Normalize => error.code().to_string(),
+        }
+    }
 }
 
 /// Validated middleware services available to a gateway or one supervisor.
@@ -259,7 +389,7 @@ impl Default for MiddlewareRegistry {
     }
 }
 
-fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<()> {
+fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<Duration> {
     if registration.name.trim().is_empty() {
         return Err(miette!(
             "supervisor middleware registration name cannot be empty"
@@ -279,7 +409,47 @@ fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<(
             registration.name
         ));
     }
-    Ok(())
+    if registration.max_body_bytes > MAX_MIDDLEWARE_BODY_BYTES as u64 {
+        return Err(miette!(
+            "middleware registration '{}' max_body_bytes exceeds the platform maximum of {MAX_MIDDLEWARE_BODY_BYTES}",
+            registration.name
+        ));
+    }
+    middleware_timeout_or_default(&registration.timeout).map_err(|reason| {
+        miette!(
+            "middleware registration '{}' has invalid timeout: {reason}",
+            registration.name
+        )
+    })
+}
+
+fn is_stable_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_STABLE_IDENTIFIER_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
+}
+
+fn validate_body_limit(source: &str, binding: &MiddlewareBinding) -> Result<usize> {
+    if binding.max_body_bytes == 0 {
+        return Err(miette!(
+            "middleware binding '{}' must advertise a non-zero body limit",
+            binding.id
+        ));
+    }
+    if binding.max_body_bytes > MAX_MIDDLEWARE_BODY_BYTES as u64 {
+        return Err(miette!(
+            "{source} binding '{}' body limit exceeds the platform maximum of {MAX_MIDDLEWARE_BODY_BYTES}",
+            binding.id
+        ));
+    }
+    usize::try_from(binding.max_body_bytes).map_err(|_| {
+        miette!(
+            "middleware binding '{}' reports a body limit too large for this platform",
+            binding.id
+        )
+    })
 }
 
 fn validate_manifest_bindings(
@@ -295,8 +465,10 @@ fn validate_manifest_bindings(
 
     let mut described_ids = Vec::with_capacity(manifest.bindings.len());
     for binding in &manifest.bindings {
-        if binding.id.trim().is_empty() {
-            return Err(miette!("{source} describes an empty binding id"));
+        if !is_stable_identifier(&binding.id) {
+            return Err(miette!(
+                "{source} binding ids must be 1-{MAX_STABLE_IDENTIFIER_BYTES} bytes and contain only ASCII letters, digits, '.', '_', '-', or '/'"
+            ));
         }
         if !allow_reserved_bindings && binding.id.starts_with("openshell/") {
             return Err(miette!(
@@ -312,17 +484,14 @@ fn validate_manifest_bindings(
                 binding.id,
             ));
         }
-        let advertised = usize::try_from(binding.max_body_bytes).map_err(|_| {
-            miette!(
-                "middleware binding '{}' reports a body limit too large for this platform",
-                binding.id
-            )
-        })?;
-        if advertised == 0 {
-            return Err(miette!(
-                "middleware binding '{}' must advertise a non-zero body limit",
-                binding.id
-            ));
+        let advertised = validate_body_limit(source, binding)?;
+        if !binding.timeout.trim().is_empty() {
+            parse_middleware_timeout(&binding.timeout).map_err(|reason| {
+                miette!(
+                    "{source} binding '{}' has invalid timeout: {reason}",
+                    binding.id
+                )
+            })?;
         }
         if operator_max_body_bytes.is_some_and(|limit| limit > advertised) {
             return Err(miette!(
@@ -357,6 +526,127 @@ fn validate_external_manifest(
     )
 }
 
+/// External diagnostic text is untrusted and may contain request data. Keep
+/// only values derived from the validated, startup-time binding identifier and
+/// numeric finding counts; do not carry per-request free-form text into logs.
+fn normalize_untrusted_diagnostics(
+    binding: &MiddlewareBinding,
+    result: &mut openshell_core::proto::HttpRequestResult,
+) {
+    let reason_id: String = binding
+        .id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    result.reason = format!("middleware_denied:{reason_id}");
+    result.metadata.clear();
+    for finding in &mut result.findings {
+        finding.r#type = format!("{}.finding", binding.id);
+        finding.label = EXTERNAL_FINDING_LABEL.to_string();
+        finding.confidence.clear();
+        finding.severity = match finding.severity.as_str() {
+            "low" => "low",
+            "high" => "high",
+            _ => "medium",
+        }
+        .to_string();
+    }
+}
+
+fn validate_request_envelope(
+    evaluation: &HttpRequestEvaluation,
+) -> std::result::Result<(), &'static str> {
+    if evaluation.body.len() > MAX_MIDDLEWARE_BODY_BYTES {
+        return Err("request_body_over_capacity");
+    }
+    if evaluation
+        .config
+        .as_ref()
+        .is_some_and(|config| config.encoded_len() > MAX_MIDDLEWARE_CONFIG_BYTES)
+    {
+        return Err("request_config_over_capacity");
+    }
+    if evaluation
+        .context
+        .as_ref()
+        .is_some_and(|context| context.encoded_len() > MAX_MIDDLEWARE_CONTEXT_BYTES)
+    {
+        return Err("request_context_over_capacity");
+    }
+    if evaluation
+        .target
+        .as_ref()
+        .is_some_and(|target| target.encoded_len() > MAX_MIDDLEWARE_TARGET_BYTES)
+    {
+        return Err("request_target_over_capacity");
+    }
+    if evaluation.headers.len() > MAX_MIDDLEWARE_HEADERS {
+        return Err("request_header_count_over_capacity");
+    }
+    let header_bytes = evaluation.headers.iter().fold(0usize, |total, header| {
+        total.saturating_add(header.encoded_len())
+    });
+    if header_bytes > MAX_MIDDLEWARE_HEADER_BYTES {
+        return Err("request_header_bytes_over_capacity");
+    }
+    if evaluation.encoded_len() > MIDDLEWARE_GRPC_MESSAGE_BYTES {
+        return Err("request_envelope_over_capacity");
+    }
+    Ok(())
+}
+
+fn validate_response_envelope(
+    result: &openshell_core::proto::HttpRequestResult,
+) -> std::result::Result<(), &'static str> {
+    if result.body.len() > MAX_MIDDLEWARE_BODY_BYTES {
+        return Err("response_body_over_capacity");
+    }
+    if result.reason.len() > MAX_MIDDLEWARE_REASON_BYTES {
+        return Err("response_reason_over_capacity");
+    }
+    if result.header_mutations.len() > headers::MAX_HEADER_MUTATIONS {
+        return Err("header_mutation_count_over_capacity");
+    }
+    let mutation_bytes = result
+        .header_mutations
+        .iter()
+        .fold(0usize, |total, mutation| {
+            total.saturating_add(mutation.encoded_len())
+        });
+    if mutation_bytes > MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES {
+        return Err("header_mutation_bytes_over_capacity");
+    }
+    if result.findings.len() > MAX_MIDDLEWARE_FINDINGS_PER_STAGE {
+        return Err("response_findings_over_capacity");
+    }
+    if result
+        .findings
+        .iter()
+        .any(|finding| finding.encoded_len() > MAX_MIDDLEWARE_FINDING_BYTES)
+    {
+        return Err("response_finding_over_capacity");
+    }
+    if result.metadata.len() > MAX_MIDDLEWARE_METADATA_ENTRIES {
+        return Err("response_metadata_count_over_capacity");
+    }
+    let metadata_bytes = result.metadata.iter().fold(0usize, |total, (key, value)| {
+        total.saturating_add(key.len()).saturating_add(value.len())
+    });
+    if metadata_bytes > MAX_MIDDLEWARE_METADATA_BYTES {
+        return Err("response_metadata_bytes_over_capacity");
+    }
+    if result.encoded_len() > MIDDLEWARE_GRPC_MESSAGE_BYTES {
+        return Err("response_envelope_over_capacity");
+    }
+    Ok(())
+}
+
 impl MiddlewareRegistry {
     /// Describe in-process services, then connect and validate every
     /// operator-provided service registration.
@@ -370,16 +660,19 @@ impl MiddlewareRegistry {
         let mut binding_ids = HashSet::new();
 
         for service in in_process_services {
-            let manifest = service
-                .describe(Request::new(()))
-                .await
-                .map(tonic::Response::into_inner)
-                .map_err(|error| {
-                    miette!(
-                        "in-process middleware Describe failed: {}",
-                        safe_reason(&error.to_string())
-                    )
-                })?;
+            let manifest = call_with_timeout(
+                DEFAULT_MIDDLEWARE_TIMEOUT,
+                "Describe",
+                service.describe(Request::new(())),
+            )
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|error| {
+                miette!(
+                    "in-process middleware Describe failed: {}",
+                    safe_reason(&error.to_string())
+                )
+            })?;
             let source = if manifest.name.trim().is_empty() {
                 "in-process middleware service".to_string()
             } else {
@@ -393,12 +686,14 @@ impl MiddlewareRegistry {
             services.push(Arc::new(MiddlewareServiceState {
                 service,
                 manifest: manifest_cell,
+                diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
                 operator_max_body_bytes: None,
+                operator_timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
             }));
         }
 
         for registration in registrations {
-            validate_registration(&registration)?;
+            let operator_timeout = validate_registration(&registration)?;
             if !registration_names.insert(registration.name.clone()) {
                 return Err(miette!(
                     "duplicate supervisor middleware registration name '{}'",
@@ -420,17 +715,20 @@ impl MiddlewareRegistry {
                 )
                 .await?,
             );
-            let manifest = service
-                .describe(Request::new(()))
-                .await
-                .map(tonic::Response::into_inner)
-                .map_err(|error| {
-                    miette!(
-                        "middleware registration '{}' Describe failed: {}",
-                        registration.name,
-                        safe_reason(&error.to_string())
-                    )
-                })?;
+            let manifest = call_with_timeout(
+                operator_timeout,
+                "Describe",
+                service.describe(Request::new(())),
+            )
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|error| {
+                miette!(
+                    "middleware registration '{}' Describe failed: {}",
+                    registration.name,
+                    safe_reason(&error.to_string())
+                )
+            })?;
             let described_ids = validate_external_manifest(
                 &registration,
                 &manifest,
@@ -444,7 +742,9 @@ impl MiddlewareRegistry {
             services.push(Arc::new(MiddlewareServiceState {
                 service,
                 manifest: manifest_cell,
+                diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
                 operator_max_body_bytes: Some(operator_max_body_bytes),
+                operator_timeout,
             }));
             registered_services.push(RegisteredMiddlewareService {
                 registration,
@@ -461,6 +761,7 @@ impl MiddlewareRegistry {
 
     /// Validate implementation-owned configuration for every middleware entry.
     pub async fn validate_policy_configs(&self, policy: &SandboxPolicy) -> Result<()> {
+        ensure_config_capacity(policy.network_middlewares.len())?;
         let runner = ChainRunner::from_registry(self.clone());
         for config in &policy.network_middlewares {
             runner
@@ -534,7 +835,9 @@ impl ChainRunner {
                 services: Arc::new(vec![Arc::new(MiddlewareServiceState {
                     service,
                     manifest: OnceCell::new(),
+                    diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
                     operator_max_body_bytes: None,
+                    operator_timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
                 })]),
                 registered_services: Arc::new(Vec::new()),
                 binding_ids: Arc::new(HashSet::new()),
@@ -554,17 +857,19 @@ impl ChainRunner {
             let manifest = state
                 .manifest
                 .get_or_try_init(|| async {
-                    state
-                        .service
-                        .describe(Request::new(()))
-                        .await
-                        .map(tonic::Response::into_inner)
-                        .map_err(|error| {
-                            miette!(
-                                "middleware Describe failed: {}",
-                                safe_reason(&error.to_string())
-                            )
-                        })
+                    call_with_timeout(
+                        state.operator_timeout,
+                        "Describe",
+                        state.service.describe(Request::new(())),
+                    )
+                    .await
+                    .map(tonic::Response::into_inner)
+                    .map_err(|error| {
+                        miette!(
+                            "middleware Describe failed: {}",
+                            safe_reason(&error.to_string())
+                        )
+                    })
                 })
                 .await?;
             manifests.push((Arc::clone(state), manifest.clone()));
@@ -573,6 +878,7 @@ impl ChainRunner {
     }
 
     pub async fn describe_chain(&self, entries: &[ChainEntry]) -> Result<Vec<DescribedChainEntry>> {
+        ensure_chain_capacity(entries.len())?;
         let manifests = self.manifests().await?;
         let mut entries = entries.to_vec();
         sort_chain_entries(&mut entries);
@@ -593,24 +899,28 @@ impl ChainRunner {
                 let max_body_bytes = binding
                     .as_ref()
                     .map(|binding| {
-                        let advertised = usize::try_from(binding.max_body_bytes).map_err(|_| {
-                            miette!(
-                                "middleware binding '{}' reports a body limit too large for this platform",
-                                binding.id
-                            )
-                        })?;
-                        Ok::<_, miette::Report>(service
-                            .as_ref()
-                            .and_then(|state| state.operator_max_body_bytes)
-                            .unwrap_or(advertised))
+                        let advertised = validate_body_limit("middleware manifest", binding)?;
+                        Ok::<_, miette::Report>(
+                            service
+                                .as_ref()
+                                .and_then(|state| state.operator_max_body_bytes)
+                                .unwrap_or(advertised),
+                        )
                     })
                     .transpose()?
                     .unwrap_or(0);
+                let timeout = service
+                    .as_ref()
+                    .zip(binding.as_ref())
+                    .map(|(state, binding)| state.timeout_for_binding(binding))
+                    .transpose()?
+                    .unwrap_or(DEFAULT_MIDDLEWARE_TIMEOUT);
                 Ok(DescribedChainEntry {
                     entry: entry.clone(),
                     service,
                     binding,
                     max_body_bytes,
+                    timeout,
                 })
             })
             .collect()
@@ -621,31 +931,41 @@ impl ChainRunner {
         implementation: &str,
         config: prost_types::Struct,
     ) -> Result<()> {
+        if config.encoded_len() > MAX_MIDDLEWARE_CONFIG_BYTES {
+            return Err(miette!(
+                "middleware config exceeds the platform maximum of {MAX_MIDDLEWARE_CONFIG_BYTES} encoded bytes"
+            ));
+        }
         let manifests = self.manifests().await?;
-        let Some((state, _)) = manifests.iter().find(|(_, manifest)| {
+        let Some((state, binding)) = manifests.iter().find_map(|(state, manifest)| {
             manifest
                 .bindings
                 .iter()
-                .any(|binding| binding.id == implementation)
+                .find(|binding| binding.id == implementation)
+                .map(|binding| (state, binding))
         }) else {
             return Err(miette!(
                 "middleware binding '{implementation}' is not registered"
             ));
         };
-        let response = state
-            .service
-            .validate_config(Request::new(ValidateConfigRequest {
-                binding_id: implementation.into(),
-                config: Some(config),
-            }))
-            .await
-            .map(tonic::Response::into_inner)
-            .map_err(|error| {
-                miette!(
-                    "middleware ValidateConfig failed: {}",
-                    safe_reason(&error.to_string())
-                )
-            })?;
+        let response = call_with_timeout(
+            state.timeout_for_binding(binding)?,
+            "ValidateConfig",
+            state
+                .service
+                .validate_config(Request::new(ValidateConfigRequest {
+                    binding_id: implementation.into(),
+                    config: Some(config),
+                })),
+        )
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(|error| {
+            miette!(
+                "middleware ValidateConfig failed: {}",
+                safe_reason(&error.to_string())
+            )
+        })?;
         if response.valid {
             Ok(())
         } else {
@@ -688,9 +1008,10 @@ impl ChainRunner {
         input: HttpRequestInput,
         transformed_body_policy: TransformedBodyPolicy<'_>,
     ) -> Result<ChainOutcome> {
+        ensure_chain_capacity(entries.len())?;
         let mut headers = input.headers.clone();
         let mut body = input.body.clone();
-        let mut added_headers = BTreeMap::new();
+        let mut header_mutations = Vec::new();
         let mut findings = Vec::new();
         let mut metadata = BTreeMap::new();
         let mut applied = Vec::new();
@@ -704,7 +1025,7 @@ impl ChainRunner {
                             allowed: false,
                             reason,
                             body,
-                            added_headers,
+                            header_mutations,
                             findings,
                             metadata,
                             applied,
@@ -720,7 +1041,7 @@ impl ChainRunner {
                             allowed: false,
                             reason,
                             body,
-                            added_headers,
+                            header_mutations,
                             findings,
                             metadata,
                             applied,
@@ -729,24 +1050,49 @@ impl ChainRunner {
                 }
             }
             let evaluation = build_evaluation(entry, binding, &input, &headers, &body);
+            if let Err(reason) = validate_request_envelope(&evaluation) {
+                match apply_on_error(entry, reason, &mut applied) {
+                    OnErrorAction::FailOpen => continue,
+                    OnErrorAction::FailClosed(reason) => {
+                        return Ok(ChainOutcome {
+                            allowed: false,
+                            reason,
+                            body,
+                            header_mutations,
+                            findings,
+                            metadata,
+                            applied,
+                        });
+                    }
+                }
+            }
             let Some(service) = entry.service.as_ref() else {
                 unreachable!("described binding always has a service")
             };
-            let result = match service
-                .service
-                .evaluate_http_request(Request::new(evaluation))
-                .await
+            let mut result = match call_with_timeout(
+                entry.timeout,
+                "EvaluateHttpRequest",
+                service
+                    .service
+                    .evaluate_http_request(Request::new(evaluation)),
+            )
+            .await
             {
                 Ok(result) => result.into_inner(),
                 Err(err) => {
-                    match apply_on_error(entry, &safe_reason(&err.to_string()), &mut applied) {
+                    let reason = if err.code() == tonic::Code::DeadlineExceeded {
+                        "middleware_timeout".to_string()
+                    } else {
+                        service.diagnostic_policy.error_reason(&err)
+                    };
+                    match apply_on_error(entry, &reason, &mut applied) {
                         OnErrorAction::FailOpen => continue,
                         OnErrorAction::FailClosed(reason) => {
                             return Ok(ChainOutcome {
                                 allowed: false,
                                 reason,
                                 body,
-                                added_headers,
+                                header_mutations,
                                 findings,
                                 metadata,
                                 applied,
@@ -755,6 +1101,27 @@ impl ChainRunner {
                     }
                 }
             };
+
+            if let Err(reason) = validate_response_envelope(&result) {
+                match apply_on_error(entry, reason, &mut applied) {
+                    OnErrorAction::FailOpen => continue,
+                    OnErrorAction::FailClosed(reason) => {
+                        return Ok(ChainOutcome {
+                            allowed: false,
+                            reason,
+                            body,
+                            header_mutations,
+                            findings,
+                            metadata,
+                            applied,
+                        });
+                    }
+                }
+            }
+
+            service
+                .diagnostic_policy
+                .process_result(binding, &mut result);
 
             let decision = match Decision::try_from(result.decision) {
                 Ok(decision @ (Decision::Allow | Decision::Deny)) => decision,
@@ -766,7 +1133,7 @@ impl ChainRunner {
                                 allowed: false,
                                 reason,
                                 body,
-                                added_headers,
+                                header_mutations,
                                 findings,
                                 metadata,
                                 applied,
@@ -800,7 +1167,7 @@ impl ChainRunner {
                     allowed: false,
                     reason: safe_reason(&result.reason),
                     body,
-                    added_headers,
+                    header_mutations,
                     findings,
                     metadata,
                     applied,
@@ -815,7 +1182,7 @@ impl ChainRunner {
                             allowed: false,
                             reason,
                             body,
-                            added_headers,
+                            header_mutations,
                             findings,
                             metadata,
                             applied,
@@ -824,32 +1191,41 @@ impl ChainRunner {
                 }
             }
 
-            // A result proposing unsafe header mutations is a malformed response:
-            // route it through `on_error` instead of applying any of it. The
-            // validation error names the offending header and the required
-            // x-openshell-middleware- prefix so operators can fix the service.
-            if let Err(error) = validate_header_mutations(&headers, &result.add_headers) {
-                match apply_on_error(entry, &safe_reason(&error.to_string()), &mut applied) {
-                    OnErrorAction::FailOpen => continue,
-                    OnErrorAction::FailClosed(reason) => {
-                        return Ok(ChainOutcome {
-                            allowed: false,
-                            reason,
-                            body,
-                            added_headers,
-                            findings,
-                            metadata,
-                            applied,
-                        });
+            // Validate and apply the entire stage atomically. Under fail-open,
+            // one malformed mutation must not leave earlier mutations from the
+            // same response visible to later middleware.
+            let updated_headers = match headers::apply(
+                &headers,
+                &input.connection_nominated_headers,
+                &result.header_mutations,
+            ) {
+                Ok(updated) => updated,
+                Err(error) => {
+                    let reason = service
+                        .diagnostic_policy
+                        .header_mutation_error_reason(&error);
+                    match apply_on_error(entry, &reason, &mut applied) {
+                        OnErrorAction::FailOpen => continue,
+                        OnErrorAction::FailClosed(reason) => {
+                            return Ok(ChainOutcome {
+                                allowed: false,
+                                reason,
+                                body,
+                                header_mutations,
+                                findings,
+                                metadata,
+                                applied,
+                            });
+                        }
                     }
                 }
-            }
-            for (name, value) in &result.add_headers {
-                headers.push((name.to_ascii_lowercase(), value.clone()));
-                added_headers.insert(name.to_ascii_lowercase(), value.clone());
-            }
-            let transformed = result.has_body;
-            if result.has_body {
+            };
+            let headers_transformed = updated_headers != headers;
+            headers = updated_headers;
+            header_mutations.extend(result.header_mutations.iter().cloned());
+
+            let body_transformed = result.has_body;
+            if body_transformed {
                 result.body.clone_into(&mut body);
             }
             for finding in result.findings {
@@ -868,7 +1244,7 @@ impl ChainRunner {
                 name: entry.entry.name.clone(),
                 implementation: entry.entry.implementation.clone(),
                 decision,
-                transformed,
+                transformed: body_transformed || headers_transformed,
                 failed: false,
             });
 
@@ -876,7 +1252,7 @@ impl ChainRunner {
             // sandbox policy the original body was admitted under. Re-check now,
             // before the next stage or the upstream sees the replaced body. A
             // policy deny here is a hard deny, independent of `on_error`.
-            if transformed
+            if body_transformed
                 && let TransformedBodyPolicy::Reevaluate(validate) = transformed_body_policy
             {
                 let denied = match validate(&body) {
@@ -891,7 +1267,7 @@ impl ChainRunner {
                         allowed: false,
                         reason,
                         body,
-                        added_headers,
+                        header_mutations,
                         findings,
                         metadata,
                         applied,
@@ -904,7 +1280,7 @@ impl ChainRunner {
             allowed: true,
             reason: String::new(),
             body,
-            added_headers,
+            header_mutations,
             findings,
             metadata,
             applied,
@@ -919,6 +1295,24 @@ pub fn sort_chain_entries(entries: &mut [ChainEntry]) {
             .cmp(&right.order)
             .then_with(|| left.name.cmp(&right.name))
     });
+}
+
+fn ensure_config_capacity(count: usize) -> Result<()> {
+    if count > MAX_MIDDLEWARE_CONFIGS {
+        return Err(miette!(
+            "middleware config count {count} exceeds platform maximum {MAX_MIDDLEWARE_CONFIGS}"
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_chain_capacity(count: usize) -> Result<()> {
+    if count > MAX_MIDDLEWARE_CHAIN_STAGES {
+        return Err(miette!(
+            "selected middleware stage count {count} exceeds platform maximum {MAX_MIDDLEWARE_CHAIN_STAGES}"
+        ));
+    }
+    Ok(())
 }
 
 fn build_evaluation(
@@ -956,61 +1350,6 @@ fn build_evaluation(
     }
 }
 
-fn validate_header_mutations(
-    existing_headers: &[(String, String)],
-    mutations: &HashMap<String, String>,
-) -> Result<()> {
-    let mut seen = HashSet::new();
-    for (name, value) in mutations {
-        let lower = name.to_ascii_lowercase();
-        if !seen.insert(lower.clone()) || existing_headers.iter().any(|(name, _)| *name == lower) {
-            return Err(miette!(
-                "middleware cannot rewrite existing header '{name}'"
-            ));
-        }
-        if !is_safe_append_header(&lower) {
-            return Err(miette!(
-                "middleware can only append new request headers prefixed with \
-                 x-openshell-middleware- and cannot append '{name}'"
-            ));
-        }
-        // Reject CR/LF and other control characters in the value: writing them
-        // verbatim into the upstream header block would enable header injection
-        // and request smuggling past the credential boundary.
-        if !is_safe_header_value(value) {
-            return Err(miette!(
-                "middleware cannot append header '{name}' with an unsafe value"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// A header value is safe to append only if it contains no control characters.
-/// Horizontal tab, printable ASCII, and obs-text (>= 0x80) are permitted; CR, LF,
-/// NUL, and other control bytes are rejected.
-fn is_safe_header_value(value: &str) -> bool {
-    value
-        .bytes()
-        .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b) || b >= 0x80)
-}
-
-fn is_safe_append_header(name: &str) -> bool {
-    if name.is_empty()
-        || name.contains(':')
-        || name.bytes().any(|b| b <= 0x20 || b >= 0x7f)
-        || matches!(
-            name,
-            "authorization" | "cookie" | "host" | "content-length" | "transfer-encoding"
-        )
-        || name.starts_with("x-amz-")
-        || name.starts_with("x-openshell-credential")
-    {
-        return false;
-    }
-    name.starts_with("x-openshell-middleware-")
-}
-
 pub(crate) fn safe_reason(reason: &str) -> String {
     reason
         .chars()
@@ -1025,7 +1364,8 @@ mod tests {
     use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
         SupervisorMiddleware, SupervisorMiddlewareServer,
     };
-    use openshell_supervisor_middleware_builtins::{BUILTIN_SECRETS, services};
+    use openshell_core::proto::{ExistingHeaderAction, header_mutation};
+    use openshell_supervisor_middleware_builtins::{BUILTIN_REGEX, services};
     use tokio_stream::wrappers::TcpListenerStream;
 
     fn builtin_runner() -> ChainRunner {
@@ -1040,11 +1380,11 @@ mod tests {
     fn entry(name: &str, on_error: OnError) -> ChainEntry {
         ChainEntry {
             name: name.into(),
-            implementation: BUILTIN_SECRETS.into(),
+            implementation: BUILTIN_REGEX.into(),
             order: 0,
             config: prost_types::Struct {
                 fields: std::iter::once((
-                    "secrets".into(),
+                    "mode".into(),
                     prost_types::Value {
                         kind: Some(prost_types::value::Kind::StringValue("redact".into())),
                     },
@@ -1066,7 +1406,20 @@ mod tests {
             path: "/v1".into(),
             query: String::new(),
             headers: Vec::new(),
+            connection_nominated_headers: Vec::new(),
             body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn write_header(name: &str, value: &str, on_existing: ExistingHeaderAction) -> HeaderMutation {
+        HeaderMutation {
+            operation: Some(header_mutation::Operation::Write(
+                openshell_core::proto::WriteHeader {
+                    name: name.into(),
+                    value: value.into(),
+                    on_existing: on_existing as i32,
+                },
+            )),
         }
     }
 
@@ -1095,7 +1448,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redacts_common_secret_patterns() {
+    async fn applies_fixed_regex_replacements() {
         let outcome = builtin_runner()
             .evaluate(
                 &[entry("redact", OnError::FailClosed)],
@@ -1118,13 +1471,13 @@ mod tests {
             entry("second", OnError::FailClosed),
         ];
         let outcome = builtin_runner()
-            .evaluate(&entries, input(r#"password="top-secret""#))
+            .evaluate(&entries, input(r#"token="sk-ABCDEFGHIJKLMNOP""#))
             .await
             .expect("evaluate");
         assert!(outcome.allowed);
         assert_eq!(
             String::from_utf8(outcome.body).expect("utf8"),
-            r#"password="[REDACTED]""#
+            r#"token="[REDACTED]""#
         );
         assert_eq!(outcome.applied.len(), 2);
     }
@@ -1147,6 +1500,37 @@ mod tests {
             .map(|entry| entry.entry.name.as_str())
             .collect();
         assert_eq!(names, vec!["alpha", "beta", "later"]);
+    }
+
+    #[tokio::test]
+    async fn describe_chain_accepts_maximum_selected_stages() {
+        let entries: Vec<_> = (0..MAX_MIDDLEWARE_CHAIN_STAGES)
+            .map(|index| entry(&format!("stage-{index}"), OnError::FailClosed))
+            .collect();
+
+        let described = builtin_runner()
+            .describe_chain(&entries)
+            .await
+            .expect("maximum selected stage count");
+        assert_eq!(described.len(), MAX_MIDDLEWARE_CHAIN_STAGES);
+    }
+
+    #[tokio::test]
+    async fn describe_chain_rejects_selected_stages_over_capacity() {
+        let entries: Vec<_> = (0..=MAX_MIDDLEWARE_CHAIN_STAGES)
+            .map(|index| entry(&format!("stage-{index}"), OnError::FailClosed))
+            .collect();
+
+        let error = builtin_runner()
+            .describe_chain(&entries)
+            .await
+            .err()
+            .expect("selected stage count over capacity");
+        assert!(
+            error
+                .to_string()
+                .contains("selected middleware stage count 11 exceeds platform maximum 10")
+        );
     }
 
     #[tokio::test]
@@ -1191,7 +1575,7 @@ mod tests {
         let policy = SandboxPolicy {
             network_middlewares: vec![NetworkMiddlewareConfig {
                 name: "redactor".into(),
-                middleware: BUILTIN_SECRETS.into(),
+                middleware: BUILTIN_REGEX.into(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -1234,33 +1618,6 @@ mod tests {
         assert!(error.to_string().contains("more than one service"));
     }
 
-    #[test]
-    fn unsafe_header_mutation_is_rejected() {
-        let err = validate_header_mutations(
-            &[],
-            &std::iter::once(("Authorization".into(), "Bearer nope".into())).collect(),
-        )
-        .expect_err("unsafe header");
-        assert!(err.to_string().contains("x-openshell-middleware-"));
-        assert!(err.to_string().contains("'Authorization'"));
-    }
-
-    #[test]
-    fn header_value_with_crlf_is_rejected() {
-        // A safe header *name* with a CRLF-bearing value must still be rejected,
-        // otherwise it would inject extra headers into the upstream request.
-        let err = validate_header_mutations(
-            &[],
-            &std::iter::once((
-                "x-openshell-middleware-inject".into(),
-                "ok\r\nAuthorization: Bearer evil".into(),
-            ))
-            .collect(),
-        )
-        .expect_err("crlf value");
-        assert!(err.to_string().contains("unsafe value"));
-    }
-
     /// A mock middleware that returns a fixed, caller-supplied result for every
     /// evaluation. Used to exercise chain behavior the built-in cannot produce
     /// (explicit deny, metadata, findings, unsafe header mutations).
@@ -1284,6 +1641,7 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: self.max_body_bytes,
+                    timeout: String::new(),
                 }],
             }))
         }
@@ -1314,6 +1672,58 @@ mod tests {
         }
     }
 
+    struct SlowService {
+        delay: Duration,
+        binding_timeout: String,
+    }
+
+    #[tonic::async_trait]
+    impl SupervisorMiddleware for SlowService {
+        async fn describe(
+            &self,
+            _request: Request<()>,
+        ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
+            Ok(tonic::Response::new(MiddlewareManifest {
+                name: "test/slow".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    id: "example/slow".into(),
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_body_bytes: 4096,
+                    timeout: self.binding_timeout.clone(),
+                }],
+            }))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: Request<ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            tokio::time::sleep(self.delay).await;
+            Ok(tonic::Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: Request<HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            tokio::time::sleep(self.delay).await;
+            Ok(tonic::Response::new(allow_result()))
+        }
+    }
+
     /// A two-binding service for exercising per-stage validation: `test/transform`
     /// replaces the body, `test/second` records that it ran and allows.
     struct TwoStageService {
@@ -1331,6 +1741,7 @@ mod tests {
                 operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                 max_body_bytes: 256 * 1024,
+                timeout: String::new(),
             };
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: "test/two-stage".into(),
@@ -1528,7 +1939,7 @@ mod tests {
 
     fn scripted_service(result: openshell_core::proto::HttpRequestResult) -> ScriptedService {
         ScriptedService {
-            binding_id: BUILTIN_SECRETS.into(),
+            binding_id: BUILTIN_REGEX.into(),
             max_body_bytes: 256 * 1024,
             result,
         }
@@ -1540,7 +1951,7 @@ mod tests {
             reason: String::new(),
             body: Vec::new(),
             has_body: false,
-            add_headers: HashMap::new(),
+            header_mutations: Vec::new(),
             findings: Vec::new(),
             metadata: HashMap::new(),
         }
@@ -1566,6 +1977,7 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: 4096,
+                    timeout: String::new(),
                 }],
             }))
         }
@@ -1597,6 +2009,131 @@ mod tests {
                 .expect("recording lock")
                 .push(request.into_inner());
             Ok(tonic::Response::new(allow_result()))
+        }
+    }
+
+    /// Three-stage service used to verify that each stage observes the header
+    /// state produced by all preceding stages.
+    struct HeaderChainService {
+        second_action: ExistingHeaderAction,
+        received: std::sync::Mutex<Vec<HttpRequestEvaluation>>,
+    }
+
+    #[tonic::async_trait]
+    impl SupervisorMiddleware for HeaderChainService {
+        async fn describe(
+            &self,
+            _request: Request<()>,
+        ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
+            Ok(tonic::Response::new(MiddlewareManifest {
+                name: "test/header-chain".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    id: "example/header-chain".into(),
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_body_bytes: 4096,
+                    timeout: String::new(),
+                }],
+            }))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: Request<ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            request: Request<HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            let evaluation = request.into_inner();
+            let invocation = {
+                let mut received = self.received.lock().expect("header chain lock");
+                let invocation = received.len();
+                received.push(evaluation);
+                invocation
+            };
+            let mut result = allow_result();
+            if invocation == 0 {
+                result.header_mutations.push(write_header(
+                    "x-openshell-middleware-chain",
+                    "first",
+                    ExistingHeaderAction::Overwrite,
+                ));
+            } else if invocation == 1 {
+                result.header_mutations.push(write_header(
+                    "x-openshell-middleware-chain",
+                    "second",
+                    self.second_action,
+                ));
+            }
+            Ok(tonic::Response::new(result))
+        }
+    }
+
+    #[tokio::test]
+    async fn later_middleware_observes_prior_header_mutations() {
+        for (action, expected) in [
+            (ExistingHeaderAction::Append, vec!["first", "second"]),
+            (ExistingHeaderAction::Overwrite, vec!["second"]),
+            (ExistingHeaderAction::Skip, vec!["first"]),
+        ] {
+            let service = Arc::new(HeaderChainService {
+                second_action: action,
+                received: std::sync::Mutex::new(Vec::new()),
+            });
+            let runner = ChainRunner::new(service.clone());
+            let entries = [
+                ChainEntry {
+                    name: "first".into(),
+                    implementation: "example/header-chain".into(),
+                    order: 0,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                },
+                ChainEntry {
+                    name: "second".into(),
+                    implementation: "example/header-chain".into(),
+                    order: 10,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                },
+                ChainEntry {
+                    name: "observer".into(),
+                    implementation: "example/header-chain".into(),
+                    order: 20,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                },
+            ];
+
+            let outcome = runner
+                .evaluate(&entries, input("payload"))
+                .await
+                .expect("evaluate header chain");
+            assert!(outcome.allowed);
+            let received = service.received.lock().expect("recorded header chain");
+            let observed: Vec<&str> = received[2]
+                .headers
+                .iter()
+                .filter(|header| header.name == "x-openshell-middleware-chain")
+                .map(|header| header.value.as_str())
+                .collect();
+            assert_eq!(observed, expected, "action {action:?}");
         }
     }
 
@@ -1648,27 +2185,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn existing_header_rewrite_is_rejected() {
-        // Any occurrence of an existing name blocks the mutation, including
-        // repeated names where only one entry matches.
-        let existing = [
-            ("x-openshell-middleware-tag".to_string(), "one".to_string()),
-            ("accept".to_string(), "application/json".to_string()),
-        ];
-        let err = validate_header_mutations(
-            &existing,
-            &std::iter::once(("X-OpenShell-Middleware-Tag".into(), "two".into())).collect(),
-        )
-        .expect_err("rewrite of existing header");
-        assert!(err.to_string().contains("cannot rewrite existing header"));
-    }
-
     fn external_registration(max_body_bytes: u64) -> SupervisorMiddlewareService {
         SupervisorMiddlewareService {
             name: "local-guard-service".into(),
             grpc_endpoint: "http://127.0.0.1:50051".into(),
             max_body_bytes,
+            ..Default::default()
         }
     }
 
@@ -1705,6 +2227,7 @@ mod tests {
             .expect("describe test service")
             .into_inner();
         let operator_max_body_bytes = usize::try_from(registration.max_body_bytes).unwrap();
+        let operator_timeout = validate_registration(&registration).expect("valid registration");
         let binding_ids = validate_external_manifest(
             &registration,
             &manifest,
@@ -1719,12 +2242,16 @@ mod tests {
                 Arc::new(MiddlewareServiceState {
                     service: builtin_service,
                     manifest: builtin_manifest_cell,
+                    diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
                     operator_max_body_bytes: None,
+                    operator_timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
                 }),
                 Arc::new(MiddlewareServiceState {
                     service,
                     manifest: manifest_cell,
+                    diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
                     operator_max_body_bytes: Some(operator_max_body_bytes),
+                    operator_timeout,
                 }),
             ]),
             registered_services: Arc::new(vec![RegisteredMiddlewareService {
@@ -1817,14 +2344,14 @@ mod tests {
         assert_eq!(described[1].max_body_bytes(), 1024);
 
         let outcome = runner
-            .evaluate_described(&described, input(r#"password="top-secret""#))
+            .evaluate_described(&described, input(r#"token="sk-ABCDEFGHIJKLMNOP""#))
             .await
             .expect("evaluate mixed chain");
         assert!(outcome.allowed);
         assert_eq!(outcome.applied.len(), 2);
         assert_eq!(
             String::from_utf8(outcome.body).expect("utf8"),
-            r#"password="[REDACTED]""#
+            r#"token="[REDACTED]""#
         );
     }
 
@@ -1851,7 +2378,7 @@ mod tests {
         redact_entry.order = 10;
         let entries = [guard_entry, redact_entry];
 
-        let body = format!("{}password=\"top-secret\"", "x".repeat(1500));
+        let body = format!("{}token=\"sk-ABCDEFGHIJKLMNOP\"", "x".repeat(1500));
         let outcome = runner
             .evaluate(&entries, input(&body))
             .await
@@ -1868,7 +2395,7 @@ mod tests {
         assert!(outcome.applied[1].transformed);
         let body = String::from_utf8(outcome.body).expect("utf8");
         assert!(body.contains("[REDACTED]"));
-        assert!(!body.contains("top-secret"));
+        assert!(!body.contains("sk-ABCDEFGHIJKLMNOP"));
     }
 
     #[tokio::test]
@@ -1892,7 +2419,7 @@ mod tests {
         };
         let entries = [entry("redact", OnError::FailClosed), guard_entry];
 
-        let body = format!("{}password=\"top-secret\"", "x".repeat(1500));
+        let body = format!("{}token=\"sk-ABCDEFGHIJKLMNOP\"", "x".repeat(1500));
         let outcome = runner
             .evaluate(&entries, input(&body))
             .await
@@ -1922,11 +2449,58 @@ mod tests {
                 operation: HTTP_REQUEST_OPERATION as i32,
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_body_bytes: 4096,
+                timeout: String::new(),
             }],
         };
         let error = validate_external_manifest(&registration, &manifest, 4097, &mut HashSet::new())
             .expect_err("operator limit must fit capability");
         assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn external_registration_rejects_body_limit_above_platform_maximum() {
+        let registration = external_registration(u64::MAX);
+        let error = validate_registration(&registration)
+            .expect_err("extreme body limit must be rejected before allocation");
+        assert!(error.to_string().contains("platform maximum"));
+    }
+
+    #[test]
+    fn manifest_rejects_body_limit_above_platform_maximum() {
+        let registration = external_registration(4096);
+        let manifest = MiddlewareManifest {
+            name: "example/service".into(),
+            service_version: "test".into(),
+            bindings: vec![MiddlewareBinding {
+                id: "example/content-guard".into(),
+                operation: HTTP_REQUEST_OPERATION as i32,
+                phase: PRE_CREDENTIALS_PHASE as i32,
+                max_body_bytes: u64::MAX,
+                timeout: String::new(),
+            }],
+        };
+        let error = validate_external_manifest(&registration, &manifest, 4096, &mut HashSet::new())
+            .expect_err("extreme advertised body limit must be rejected");
+        assert!(error.to_string().contains("platform maximum"));
+    }
+
+    #[test]
+    fn manifest_rejects_unstable_binding_identifier() {
+        let registration = external_registration(4096);
+        let manifest = MiddlewareManifest {
+            name: "example/service".into(),
+            service_version: "test".into(),
+            bindings: vec![MiddlewareBinding {
+                id: "example/content-guard\nforged".into(),
+                operation: HTTP_REQUEST_OPERATION as i32,
+                phase: PRE_CREDENTIALS_PHASE as i32,
+                max_body_bytes: 4096,
+                timeout: String::new(),
+            }],
+        };
+        let error = validate_external_manifest(&registration, &manifest, 4096, &mut HashSet::new())
+            .expect_err("control characters must be rejected in binding ids");
+        assert!(error.to_string().contains("binding ids must be"));
     }
 
     #[test]
@@ -1936,10 +2510,11 @@ mod tests {
             name: "example/service".into(),
             service_version: "test".into(),
             bindings: vec![MiddlewareBinding {
-                id: "openshell/secrets".into(),
+                id: "openshell/regex".into(),
                 operation: HTTP_REQUEST_OPERATION as i32,
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_body_bytes: 4096,
+                timeout: String::new(),
             }],
         };
         let error = validate_external_manifest(&registration, &manifest, 4096, &mut HashSet::new())
@@ -1965,6 +2540,172 @@ mod tests {
         registration.grpc_endpoint = "ftp://middleware.example.com".into();
         let error = validate_registration(&registration).expect_err("unsupported scheme");
         assert!(error.to_string().contains("http:// or https://"));
+    }
+
+    #[test]
+    fn registration_timeout_uses_default_and_operator_override() {
+        let registration = external_registration(4096);
+        let timeout = validate_registration(&registration).expect("default timeout");
+        assert_eq!(timeout, DEFAULT_MIDDLEWARE_TIMEOUT);
+
+        let mut registration = external_registration(4096);
+        registration.timeout = "2s".into();
+        let timeout = validate_registration(&registration).expect("operator timeout");
+        assert_eq!(timeout, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn registration_timeout_enforces_bounds() {
+        for timeout in ["9ms", "31s"] {
+            let mut registration = external_registration(4096);
+            registration.timeout = timeout.into();
+            assert!(validate_registration(&registration).is_err());
+        }
+    }
+
+    #[test]
+    fn manifest_binding_timeout_enforces_bounds() {
+        let registration = external_registration(4096);
+        for timeout in ["9ms", "31s"] {
+            let manifest = MiddlewareManifest {
+                name: "example/service".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    id: "example/content-guard".into(),
+                    operation: HTTP_REQUEST_OPERATION as i32,
+                    phase: PRE_CREDENTIALS_PHASE as i32,
+                    max_body_bytes: 4096,
+                    timeout: timeout.into(),
+                }],
+            };
+            let error =
+                validate_external_manifest(&registration, &manifest, 4096, &mut HashSet::new())
+                    .expect_err("out-of-bounds binding timeout must be rejected");
+            assert!(error.to_string().contains("invalid timeout"));
+        }
+    }
+
+    #[tokio::test]
+    async fn binding_timeout_override_controls_evaluation_and_on_error() {
+        let mut registration = external_registration(4096);
+        registration.timeout = "2s".into();
+        let registry = registry_with_external(
+            Arc::new(SlowService {
+                delay: Duration::from_millis(50),
+                binding_timeout: "10ms".into(),
+            }),
+            registration,
+        )
+        .await;
+        let runner = ChainRunner::from_registry(registry);
+        let slow_entry = |on_error| ChainEntry {
+            name: "slow".into(),
+            implementation: "example/slow".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error,
+        };
+
+        let described = runner
+            .describe_chain(&[slow_entry(OnError::FailClosed)])
+            .await
+            .expect("describe slow binding");
+        assert_eq!(described[0].timeout(), Duration::from_millis(10));
+
+        let closed = runner
+            .evaluate(&[slow_entry(OnError::FailClosed)], input("payload"))
+            .await
+            .expect("fail-closed timeout outcome");
+        assert!(!closed.allowed);
+        assert_eq!(closed.reason, "middleware_failed: middleware_timeout");
+
+        let open = runner
+            .evaluate(&[slow_entry(OnError::FailOpen)], input("payload"))
+            .await
+            .expect("fail-open timeout outcome");
+        assert!(open.allowed);
+        assert!(open.applied[0].failed);
+    }
+
+    #[tokio::test]
+    async fn operator_timeout_controls_binding_without_manifest_override() {
+        let mut registration = external_registration(4096);
+        registration.timeout = "10ms".into();
+        let registry = registry_with_external(
+            Arc::new(SlowService {
+                delay: Duration::from_millis(50),
+                binding_timeout: String::new(),
+            }),
+            registration,
+        )
+        .await;
+        let runner = ChainRunner::from_registry(registry);
+        let slow_entry = ChainEntry {
+            name: "slow".into(),
+            implementation: "example/slow".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        };
+
+        let described = runner
+            .describe_chain(std::slice::from_ref(&slow_entry))
+            .await
+            .expect("describe slow binding");
+        assert_eq!(described[0].timeout(), Duration::from_millis(10));
+
+        let outcome = runner
+            .evaluate(&[slow_entry], input("payload"))
+            .await
+            .expect("operator timeout outcome");
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.reason, "middleware_failed: middleware_timeout");
+    }
+
+    #[tokio::test]
+    async fn operator_timeout_caps_longer_binding_timeout_for_validation_and_evaluation() {
+        let mut registration = external_registration(4096);
+        registration.timeout = "10ms".into();
+        let registry = registry_with_external(
+            Arc::new(SlowService {
+                delay: Duration::from_millis(50),
+                binding_timeout: "2s".into(),
+            }),
+            registration,
+        )
+        .await;
+        let runner = ChainRunner::from_registry(registry);
+        let slow_entry = ChainEntry {
+            name: "slow".into(),
+            implementation: "example/slow".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        };
+
+        let described = runner
+            .describe_chain(std::slice::from_ref(&slow_entry))
+            .await
+            .expect("describe slow binding");
+        assert_eq!(described[0].timeout(), Duration::from_millis(10));
+
+        let validation_error = runner
+            .validate_config("example/slow", prost_types::Struct::default())
+            .await
+            .expect_err("operator timeout must cap ValidateConfig");
+        assert!(
+            validation_error
+                .to_string()
+                .contains("ValidateConfig failed")
+        );
+        assert!(validation_error.to_string().contains("timed out"));
+
+        let outcome = runner
+            .evaluate(&[slow_entry], input("payload"))
+            .await
+            .expect("operator-capped evaluation outcome");
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.reason, "middleware_failed: middleware_timeout");
     }
 
     #[tokio::test]
@@ -2034,6 +2775,344 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_transport_accepts_maximum_bounded_request_and_response_envelopes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test middleware");
+        let address = listener.local_addr().expect("test middleware address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let response_findings = (0..MAX_MIDDLEWARE_FINDINGS_PER_STAGE)
+            .map(|_| Finding {
+                r#type: "f".repeat(1024),
+                label: "finding".into(),
+                count: 1,
+                confidence: "medium".into(),
+                severity: "medium".into(),
+            })
+            .collect();
+        let server = tonic::transport::Server::builder()
+            .add_service(
+                SupervisorMiddlewareServer::new(ScriptedService {
+                    binding_id: "example/content-guard".into(),
+                    max_body_bytes: MAX_MIDDLEWARE_BODY_BYTES as u64,
+                    result: openshell_core::proto::HttpRequestResult {
+                        reason: "r".repeat(MAX_MIDDLEWARE_REASON_BYTES - 128),
+                        body: vec![b'x'; MAX_MIDDLEWARE_BODY_BYTES],
+                        has_body: true,
+                        header_mutations: vec![write_header(
+                            "x-openshell-middleware-envelope",
+                            &"h".repeat(headers::MAX_HEADER_MUTATION_BYTES - 128),
+                            ExistingHeaderAction::Append,
+                        )],
+                        findings: response_findings,
+                        metadata: std::iter::once((
+                            "diagnostic".into(),
+                            "m".repeat(MAX_MIDDLEWARE_METADATA_BYTES - 128),
+                        ))
+                        .collect(),
+                        ..allow_result()
+                    },
+                })
+                .max_decoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
+            )
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            });
+        let server_task = tokio::spawn(server);
+
+        let mut registration = external_registration(MAX_MIDDLEWARE_BODY_BYTES as u64);
+        registration.grpc_endpoint = format!("http://{address}");
+        let registry = MiddlewareRegistry::connect_services(Vec::new(), vec![registration])
+            .await
+            .expect("connect external middleware");
+        let config = prost_types::Struct {
+            fields: std::iter::once((
+                "payload".into(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue(
+                        "c".repeat(MAX_MIDDLEWARE_CONFIG_BYTES - 256),
+                    )),
+                },
+            ))
+            .collect(),
+        };
+        assert!(config.encoded_len() <= MAX_MIDDLEWARE_CONFIG_BYTES);
+        let mut request = input("");
+        request.request_id = "r".repeat(MAX_MIDDLEWARE_CONTEXT_BYTES - 256);
+        request.path = format!("/{}", "p".repeat(MAX_MIDDLEWARE_TARGET_BYTES - 512));
+        request.headers = vec![(
+            "x-large-envelope".into(),
+            "v".repeat(MAX_MIDDLEWARE_HEADER_BYTES - 256),
+        )];
+        request.body = vec![b'b'; MAX_MIDDLEWARE_BODY_BYTES];
+        let outcome = ChainRunner::from_registry(registry)
+            .evaluate(
+                &[ChainEntry {
+                    name: "guard".into(),
+                    implementation: "example/content-guard".into(),
+                    order: 0,
+                    config,
+                    on_error: OnError::FailClosed,
+                }],
+                request,
+            )
+            .await
+            .expect("maximum bounded envelopes should fit configured transport limit");
+
+        assert!(outcome.allowed);
+        assert_eq!(outcome.body.len(), MAX_MIDDLEWARE_BODY_BYTES);
+        assert_eq!(outcome.header_mutations.len(), 1);
+        assert_eq!(outcome.findings.len(), MAX_MIDDLEWARE_FINDINGS_PER_STAGE);
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join test middleware")
+            .expect("serve");
+    }
+
+    #[test]
+    fn grpc_envelope_headroom_matches_bounded_components() {
+        assert_eq!(MIDDLEWARE_GRPC_ENVELOPE_BYTES, 292 * 1024);
+        assert_eq!(
+            MIDDLEWARE_GRPC_MESSAGE_BYTES,
+            MAX_MIDDLEWARE_BODY_BYTES + 292 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn external_diagnostics_are_normalized_before_reaching_logs() {
+        let secret = "sk-secret-request-value";
+        let registration = external_registration(4096);
+        let service = Arc::new(ScriptedService {
+            binding_id: "example/content-guard".into(),
+            max_body_bytes: 4096,
+            result: openshell_core::proto::HttpRequestResult {
+                decision: Decision::Deny as i32,
+                reason: format!("denied body={secret}\nFINDING:FORGED"),
+                findings: vec![Finding {
+                    r#type: format!("secret.{secret}\nforged"),
+                    label: format!("matched {secret}\nFINDING:FORGED"),
+                    count: 1,
+                    confidence: secret.into(),
+                    severity: "high\nFINDING:FORGED".into(),
+                }],
+                metadata: std::iter::once(("request".into(), secret.into())).collect(),
+                ..allow_result()
+            },
+        });
+        let registry = registry_with_external(service, registration).await;
+        let outcome = ChainRunner::from_registry(registry)
+            .evaluate(
+                &[ChainEntry {
+                    name: "guard".into(),
+                    implementation: "example/content-guard".into(),
+                    order: 0,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                }],
+                input("hello"),
+            )
+            .await
+            .expect("evaluate external middleware");
+
+        assert_eq!(outcome.reason, "middleware_denied:example_content-guard");
+        assert_eq!(
+            outcome.findings[0].finding.r#type,
+            "example/content-guard.finding"
+        );
+        assert_eq!(outcome.findings[0].finding.label, EXTERNAL_FINDING_LABEL);
+        assert_eq!(outcome.findings[0].finding.severity, "medium");
+        assert!(outcome.metadata.is_empty());
+        assert!(!format!("{outcome:?}").contains(secret));
+        assert!(!format!("{outcome:?}").contains("FINDING:FORGED"));
+    }
+
+    #[tokio::test]
+    async fn external_header_mutation_failure_uses_platform_reason() {
+        let secret = "sk-secret-request-value";
+        let registration = external_registration(4096);
+        let service = Arc::new(ScriptedService {
+            binding_id: "example/content-guard".into(),
+            max_body_bytes: 4096,
+            result: openshell_core::proto::HttpRequestResult {
+                header_mutations: vec![write_header(
+                    &format!("x-openshell-middleware-invalid\n{secret}"),
+                    "value",
+                    ExistingHeaderAction::Append,
+                )],
+                ..allow_result()
+            },
+        });
+        let registry = registry_with_external(service, registration).await;
+        let outcome = ChainRunner::from_registry(registry)
+            .evaluate(
+                &[ChainEntry {
+                    name: "guard".into(),
+                    implementation: "example/content-guard".into(),
+                    order: 0,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                }],
+                input("hello"),
+            )
+            .await
+            .expect("evaluate external middleware");
+
+        assert!(!outcome.allowed);
+        assert_eq!(
+            outcome.reason,
+            "middleware_failed: header_mutation_invalid_name"
+        );
+        assert!(outcome.findings.is_empty());
+        assert!(!format!("{outcome:?}").contains(secret));
+    }
+
+    #[tokio::test]
+    async fn connection_nominated_write_and_remove_are_rejected_after_filtering() {
+        let mutations = [
+            write_header(
+                "x-openshell-middleware-tag",
+                "value",
+                ExistingHeaderAction::Append,
+            ),
+            HeaderMutation {
+                operation: Some(header_mutation::Operation::Remove(
+                    openshell_core::proto::RemoveHeader {
+                        name: "x-openshell-middleware-tag".into(),
+                    },
+                )),
+            },
+        ];
+
+        for mutation in mutations {
+            let service = Arc::new(ScriptedService {
+                binding_id: "example/content-guard".into(),
+                max_body_bytes: 4096,
+                result: openshell_core::proto::HttpRequestResult {
+                    header_mutations: vec![mutation],
+                    ..allow_result()
+                },
+            });
+            let registry = registry_with_external(service, external_registration(4096)).await;
+            let mut request = input("hello");
+            request.connection_nominated_headers = vec!["x-openshell-middleware-tag".into()];
+
+            let outcome = ChainRunner::from_registry(registry)
+                .evaluate(
+                    &[ChainEntry {
+                        name: "guard".into(),
+                        implementation: "example/content-guard".into(),
+                        order: 0,
+                        config: prost_types::Struct::default(),
+                        on_error: OnError::FailClosed,
+                    }],
+                    request,
+                )
+                .await
+                .expect("evaluate external middleware");
+
+            assert!(!outcome.allowed);
+            assert_eq!(
+                outcome.reason,
+                "middleware_failed: header_mutation_hop_by_hop_header"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn finding_overflow_is_an_invalid_response_governed_by_on_error() {
+        let registration = external_registration(4096);
+        let service = Arc::new(ScriptedService {
+            binding_id: "example/content-guard".into(),
+            max_body_bytes: 4096,
+            result: openshell_core::proto::HttpRequestResult {
+                findings: vec![Finding::default(); MAX_MIDDLEWARE_FINDINGS_PER_STAGE + 1],
+                ..allow_result()
+            },
+        });
+        let registry = registry_with_external(service, registration).await;
+        let runner = ChainRunner::from_registry(registry);
+
+        for (on_error, allowed) in [(OnError::FailClosed, false), (OnError::FailOpen, true)] {
+            let outcome = runner
+                .evaluate(
+                    &[ChainEntry {
+                        name: "guard".into(),
+                        implementation: "example/content-guard".into(),
+                        order: 0,
+                        config: prost_types::Struct::default(),
+                        on_error,
+                    }],
+                    input("hello"),
+                )
+                .await
+                .expect("evaluate finding overflow");
+
+            assert_eq!(outcome.allowed, allowed);
+            assert!(outcome.findings.is_empty());
+            assert_eq!(outcome.applied.len(), 1);
+            assert!(outcome.applied[0].failed);
+            if !allowed {
+                assert_eq!(
+                    outcome.reason,
+                    "middleware_failed: response_findings_over_capacity"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn maximum_chain_retains_findings_from_every_stage() {
+        let runner = ChainRunner::new(Arc::new(ScriptedService {
+            binding_id: "example/content-guard".into(),
+            max_body_bytes: 4096,
+            result: openshell_core::proto::HttpRequestResult {
+                findings: vec![
+                    Finding {
+                        r#type: "example.finding".into(),
+                        label: "Example finding".into(),
+                        count: 1,
+                        confidence: String::new(),
+                        severity: "medium".into(),
+                    };
+                    MAX_MIDDLEWARE_FINDINGS_PER_STAGE
+                ],
+                ..allow_result()
+            },
+        }));
+        let entries: Vec<_> = (0..MAX_MIDDLEWARE_CHAIN_STAGES)
+            .map(|index| ChainEntry {
+                name: format!("guard-{index}"),
+                implementation: "example/content-guard".into(),
+                order: i32::try_from(index).expect("bounded stage index"),
+                config: prost_types::Struct::default(),
+                on_error: OnError::FailClosed,
+            })
+            .collect();
+
+        let outcome = runner
+            .evaluate(&entries, input("hello"))
+            .await
+            .expect("evaluate maximum chain");
+
+        assert!(outcome.allowed);
+        assert_eq!(outcome.applied.len(), MAX_MIDDLEWARE_CHAIN_STAGES);
+        assert_eq!(outcome.findings.len(), MAX_MIDDLEWARE_CHAIN_FINDINGS);
+        for (stage, findings) in outcome
+            .findings
+            .chunks_exact(MAX_MIDDLEWARE_FINDINGS_PER_STAGE)
+            .enumerate()
+        {
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.middleware == format!("guard-{stage}"))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn deny_decision_short_circuits_chain() {
         let runner = ChainRunner::new(Arc::new(scripted_service(
             openshell_core::proto::HttpRequestResult {
@@ -2066,11 +3145,11 @@ mod tests {
             openshell_core::proto::HttpRequestResult {
                 decision: Decision::Deny as i32,
                 reason: "blocked_by_policy".into(),
-                add_headers: std::iter::once((
-                    "x-openshell-middleware-inject".to_string(),
-                    "ok\r\nHost: evil".to_string(),
-                ))
-                .collect(),
+                header_mutations: vec![write_header(
+                    "x-openshell-middleware-inject",
+                    "ok\r\nHost: evil",
+                    ExistingHeaderAction::Append,
+                )],
                 ..allow_result()
             },
         )));
@@ -2082,7 +3161,7 @@ mod tests {
 
         assert!(!outcome.allowed);
         assert_eq!(outcome.reason, "blocked_by_policy");
-        assert!(outcome.added_headers.is_empty());
+        assert!(outcome.header_mutations.is_empty());
         assert_eq!(outcome.applied.len(), 1);
         assert_eq!(outcome.applied[0].decision, Decision::Deny);
         assert!(!outcome.applied[0].failed);
@@ -2091,7 +3170,7 @@ mod tests {
     #[tokio::test]
     async fn deny_decision_ignores_oversized_replacement_under_fail_open() {
         let runner = ChainRunner::new(Arc::new(ScriptedService {
-            binding_id: BUILTIN_SECRETS.into(),
+            binding_id: BUILTIN_REGEX.into(),
             max_body_bytes: 4,
             result: openshell_core::proto::HttpRequestResult {
                 decision: Decision::Deny as i32,
@@ -2157,11 +3236,18 @@ mod tests {
 
     fn unsafe_header_service() -> ScriptedService {
         scripted_service(openshell_core::proto::HttpRequestResult {
-            add_headers: std::iter::once((
-                "x-openshell-middleware-inject".to_string(),
-                "ok\r\nHost: evil".to_string(),
-            ))
-            .collect(),
+            header_mutations: vec![
+                write_header(
+                    "x-openshell-middleware-safe",
+                    "safe",
+                    ExistingHeaderAction::Append,
+                ),
+                write_header(
+                    "x-openshell-middleware-inject",
+                    "ok\r\nHost: evil",
+                    ExistingHeaderAction::Append,
+                ),
+            ],
             ..allow_result()
         })
     }
@@ -2183,8 +3269,9 @@ mod tests {
             outcome.reason
         );
         assert!(outcome.applied.iter().any(|inv| inv.failed));
-        // The unsafe header is never forwarded.
-        assert!(outcome.added_headers.is_empty());
+        // The stage is atomic: neither the unsafe mutation nor the safe
+        // mutation preceding it is forwarded.
+        assert!(outcome.header_mutations.is_empty());
     }
 
     #[tokio::test]
@@ -2196,7 +3283,7 @@ mod tests {
             .expect("evaluate");
         assert!(outcome.allowed);
         assert_eq!(outcome.body, b"hello");
-        assert!(outcome.added_headers.is_empty());
+        assert!(outcome.header_mutations.is_empty());
         assert_eq!(outcome.applied.len(), 1);
         assert!(outcome.applied[0].failed);
     }
@@ -2204,7 +3291,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_replacement_body_honors_on_error() {
         let runner = ChainRunner::new(Arc::new(ScriptedService {
-            binding_id: BUILTIN_SECRETS.into(),
+            binding_id: BUILTIN_REGEX.into(),
             max_body_bytes: 4,
             result: openshell_core::proto::HttpRequestResult {
                 body: b"too large".to_vec(),
@@ -2239,7 +3326,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_request_body_honors_on_error() {
         let runner = ChainRunner::new(Arc::new(ScriptedService {
-            binding_id: BUILTIN_SECRETS.into(),
+            binding_id: BUILTIN_REGEX.into(),
             max_body_bytes: 4,
             result: allow_result(),
         }));
