@@ -48,7 +48,7 @@ COMPRESSED_DIR="${ROOT}/target/vm-runtime-compressed"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
 DRIVER_BIN="${ROOT}/target/debug/openshell-driver-vm"
 E2E_TEST="${OPENSHELL_E2E_VM_TEST:-smoke}"
-E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm}"
+E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm,e2e-api-conformance}"
 
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
 # AF_UNIX SUN_LEN is 104 bytes on macOS (108 on Linux), so paths anchored
@@ -281,6 +281,9 @@ e2e_register_mtls_gateway \
   "${PKI_DIR}"
 
 export OPENSHELL_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
+export OPENSHELL_CONFORMANCE_TLS_CA="${PKI_DIR}/ca.crt"
+export OPENSHELL_CONFORMANCE_TLS_CERT="${PKI_DIR}/client/tls.crt"
+export OPENSHELL_CONFORMANCE_TLS_KEY="${PKI_DIR}/client/tls.key"
 export OPENSHELL_E2E_EXPECT_VM_OVERLAY=1
 export OPENSHELL_E2E_DRIVER="vm"
 export OPENSHELL_E2E_VM_STATE_DIR="${RUN_STATE_DIR}"
@@ -304,3 +307,13 @@ cargo test \
   -- --nocapture
 
 echo "==> ${E2E_TEST} test passed."
+
+if [ "${E2E_TEST}" != "conformance" ]; then
+  echo "==> Running e2e API conformance against the VM gateway"
+  cargo test \
+    --manifest-path "${ROOT}/e2e/rust/Cargo.toml" \
+    --features "${E2E_FEATURES}" \
+    --test conformance \
+    -- --nocapture
+  echo "==> API conformance test passed."
+fi
