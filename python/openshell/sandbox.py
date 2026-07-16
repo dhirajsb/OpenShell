@@ -26,6 +26,7 @@ from ._proto import (
     openshell_pb2,
     openshell_pb2_grpc,
 )
+from ._tracing import span as _span
 
 _ClientCallDetailsBase = namedtuple(
     "_ClientCallDetailsBase",
@@ -422,7 +423,10 @@ class SandboxClient:
         self.close()
 
     def health(self) -> openshell_pb2.HealthResponse:
-        return self._stub.Health(openshell_pb2.HealthRequest(), timeout=self._timeout)
+        with _span("openshell.sandbox.health"):
+            return self._stub.Health(
+                openshell_pb2.HealthRequest(), timeout=self._timeout
+            )
 
     def create(
         self,
@@ -432,18 +436,24 @@ class SandboxClient:
         labels: Mapping[str, str] | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
-        response = self._stub.CreateSandbox(
-            openshell_pb2.CreateSandboxRequest(
-                spec=request_spec,
-                name=name or "",
-                labels=dict(labels) if labels else {},
-            ),
-            timeout=self._timeout,
-        )
-        sandbox_ref = _sandbox_ref(response.sandbox)
-        if sandbox_ref.id == "":
-            raise SandboxError("CreateSandbox returned empty sandbox id")
-        return sandbox_ref
+        with _span(
+            "openshell.sandbox.create",
+            attributes={"openshell.sandbox.name": name or ""},
+        ) as active_span:
+            response = self._stub.CreateSandbox(
+                openshell_pb2.CreateSandboxRequest(
+                    spec=request_spec,
+                    name=name or "",
+                    labels=dict(labels) if labels else {},
+                ),
+                timeout=self._timeout,
+            )
+            sandbox_ref = _sandbox_ref(response.sandbox)
+            if sandbox_ref.id == "":
+                raise SandboxError("CreateSandbox returned empty sandbox id")
+            if active_span is not None:
+                active_span.set_attribute("openshell.sandbox.id", sandbox_ref.id)
+            return sandbox_ref
 
     def create_session(
         self,
@@ -455,11 +465,15 @@ class SandboxClient:
         return SandboxSession(self, self.create(spec=spec, name=name, labels=labels))
 
     def get(self, sandbox_name: str) -> SandboxRef:
-        response = self._stub.GetSandbox(
-            openshell_pb2.GetSandboxRequest(name=sandbox_name),
-            timeout=self._timeout,
-        )
-        return _sandbox_ref(response.sandbox)
+        with _span(
+            "openshell.sandbox.get",
+            attributes={"openshell.sandbox.name": sandbox_name},
+        ):
+            response = self._stub.GetSandbox(
+                openshell_pb2.GetSandboxRequest(name=sandbox_name),
+                timeout=self._timeout,
+            )
+            return _sandbox_ref(response.sandbox)
 
     def get_session(self, sandbox_name: str) -> SandboxSession:
         return SandboxSession(self, self.get(sandbox_name))
@@ -471,15 +485,26 @@ class SandboxClient:
         offset: int = 0,
         label_selector: str | None = None,
     ) -> builtins.list[SandboxRef]:
-        response = self._stub.ListSandboxes(
-            openshell_pb2.ListSandboxesRequest(
-                limit=limit,
-                offset=offset,
-                label_selector=label_selector or "",
-            ),
-            timeout=self._timeout,
-        )
-        return [_sandbox_ref(item) for item in response.sandboxes]
+        with _span(
+            "openshell.sandbox.list",
+            attributes={
+                "openshell.list.limit": limit,
+                "openshell.list.offset": offset,
+                "openshell.list.label_selector": label_selector,
+            },
+        ) as active_span:
+            response = self._stub.ListSandboxes(
+                openshell_pb2.ListSandboxesRequest(
+                    limit=limit,
+                    offset=offset,
+                    label_selector=label_selector or "",
+                ),
+                timeout=self._timeout,
+            )
+            refs = [_sandbox_ref(item) for item in response.sandboxes]
+            if active_span is not None:
+                active_span.set_attribute("openshell.list.count", len(refs))
+            return refs
 
     def list_ids(
         self,
@@ -496,39 +521,60 @@ class SandboxClient:
         ]
 
     def delete(self, sandbox_name: str) -> bool:
-        response = self._stub.DeleteSandbox(
-            openshell_pb2.DeleteSandboxRequest(name=sandbox_name),
-            timeout=self._timeout,
-        )
-        return bool(response.deleted)
+        with _span(
+            "openshell.sandbox.delete",
+            attributes={"openshell.sandbox.name": sandbox_name},
+        ) as active_span:
+            response = self._stub.DeleteSandbox(
+                openshell_pb2.DeleteSandboxRequest(name=sandbox_name),
+                timeout=self._timeout,
+            )
+            deleted = bool(response.deleted)
+            if active_span is not None:
+                active_span.set_attribute("openshell.sandbox.deleted", deleted)
+            return deleted
 
     def wait_deleted(self, sandbox_name: str, *, timeout_seconds: float = 60.0) -> None:
-        deadline = time.time() + timeout_seconds
-        while time.time() < deadline:
-            try:
-                self.get(sandbox_name)
-            except grpc.RpcError as exc:
-                if (
-                    isinstance(exc, grpc.Call)
-                    and exc.code() == grpc.StatusCode.NOT_FOUND
-                ):
-                    return
-                raise
-            time.sleep(1)
-        raise SandboxError(f"sandbox {sandbox_name} was not deleted within timeout")
+        with _span(
+            "openshell.sandbox.wait_deleted",
+            attributes={
+                "openshell.sandbox.name": sandbox_name,
+                "openshell.wait.timeout_seconds": timeout_seconds,
+            },
+        ):
+            deadline = time.time() + timeout_seconds
+            while time.time() < deadline:
+                try:
+                    self.get(sandbox_name)
+                except grpc.RpcError as exc:
+                    if (
+                        isinstance(exc, grpc.Call)
+                        and exc.code() == grpc.StatusCode.NOT_FOUND
+                    ):
+                        return
+                    raise
+                time.sleep(1)
+            raise SandboxError(f"sandbox {sandbox_name} was not deleted within timeout")
 
     def wait_ready(
         self, sandbox_name: str, *, timeout_seconds: float = 300.0
     ) -> SandboxRef:
-        deadline = time.time() + timeout_seconds
-        while time.time() < deadline:
-            sandbox = self.get(sandbox_name)
-            if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_READY:
-                return sandbox
-            if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
-                raise SandboxError(f"sandbox {sandbox_name} entered error phase")
-            time.sleep(1)
-        raise SandboxError(f"sandbox {sandbox_name} was not ready within timeout")
+        with _span(
+            "openshell.sandbox.wait_ready",
+            attributes={
+                "openshell.sandbox.name": sandbox_name,
+                "openshell.wait.timeout_seconds": timeout_seconds,
+            },
+        ):
+            deadline = time.time() + timeout_seconds
+            while time.time() < deadline:
+                sandbox = self.get(sandbox_name)
+                if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_READY:
+                    return sandbox
+                if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
+                    raise SandboxError(f"sandbox {sandbox_name} entered error phase")
+                time.sleep(1)
+            raise SandboxError(f"sandbox {sandbox_name} was not ready within timeout")
 
     def exec_stream(
         self,
@@ -595,27 +641,37 @@ class SandboxClient:
         stdin: bytes | None = None,
         timeout_seconds: int | None = None,
     ) -> ExecResult:
-        result: ExecResult | None = None
-        for item in self.exec_stream(
-            sandbox_id,
-            command,
-            workdir=workdir,
-            env=env,
-            stdin=stdin,
-            timeout_seconds=timeout_seconds,
-        ):
-            if stream_output and isinstance(item, ExecChunk):
-                if item.stream == "stdout":
-                    sys.stdout.buffer.write(item.data)
-                    sys.stdout.flush()
-                else:
-                    sys.stderr.buffer.write(item.data)
-                    sys.stderr.flush()
-            if isinstance(item, ExecResult):
-                result = item
-        if result is None:
-            raise SandboxError("ExecSandbox did not return a result")
-        return result
+        with _span(
+            "openshell.sandbox.exec",
+            attributes={
+                "openshell.sandbox.id": sandbox_id,
+                # Argument count only; command tokens may carry secrets.
+                "openshell.exec.argc": len(command),
+            },
+        ) as active_span:
+            result: ExecResult | None = None
+            for item in self.exec_stream(
+                sandbox_id,
+                command,
+                workdir=workdir,
+                env=env,
+                stdin=stdin,
+                timeout_seconds=timeout_seconds,
+            ):
+                if stream_output and isinstance(item, ExecChunk):
+                    if item.stream == "stdout":
+                        sys.stdout.buffer.write(item.data)
+                        sys.stdout.flush()
+                    else:
+                        sys.stderr.buffer.write(item.data)
+                        sys.stderr.flush()
+                if isinstance(item, ExecResult):
+                    result = item
+            if result is None:
+                raise SandboxError("ExecSandbox did not return a result")
+            if active_span is not None:
+                active_span.set_attribute("openshell.exec.exit_code", result.exit_code)
+            return result
 
     def exec_python(
         self,

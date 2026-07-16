@@ -39,6 +39,16 @@ classifiers = [
 ]
 keywords = ["agent", "sandbox", "nvidia"]
 
+[project.optional-dependencies]
+# Optional OpenTelemetry tracing hooks. Installing this extra lets the SDK
+# emit spans around sandbox operations when the host process configures an
+# OpenTelemetry SDK; without it (or without a configured provider) tracing
+# is a complete no-op. Only the API is required — applications supply their
+# own SDK / exporter.
+otel = [
+    "opentelemetry-api>=1.20",
+]
+
 [project.urls]
 source = "https://github.com/NVIDIA/OpenShell"
 documentation = "https://docs.nvidia.com/openshell/latest/"
@@ -57,6 +67,9 @@ dev = [
     "pyelftools>=0.30",
     "pyyaml==6.0.2",
     "types-pyyaml>=6.0.12.20260518",
+    # Exercise the OpenTelemetry span-emitting path in tests. The SDK pulls
+    # in opentelemetry-api transitively and provides the in-memory exporter.
+    "opentelemetry-sdk>=1.20",
 ]
 
 [tool.uv]
