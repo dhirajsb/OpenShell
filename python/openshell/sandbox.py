@@ -41,6 +41,8 @@ if TYPE_CHECKING:
     import builtins
     from collections.abc import Callable, Iterator, Mapping, Sequence
 
+    from .checkpoint import Checkpoint
+
 
 @dataclass(frozen=True)
 class TlsConfig:
@@ -246,6 +248,28 @@ class SandboxSession:
 
     def delete(self) -> bool:
         return self._client.delete(self.sandbox.name)
+
+    def pause(self, *, checkpoint_on_pause: bool = False) -> SandboxRef:
+        """Suspend this session's sandbox. See :meth:`SandboxClient.pause`."""
+        return self._client.pause(
+            self.sandbox.name, checkpoint_on_pause=checkpoint_on_pause
+        )
+
+    def resume(self) -> SandboxRef:
+        """Resume this session's sandbox. See :meth:`SandboxClient.resume`."""
+        return self._client.resume(self.sandbox.name)
+
+    def checkpoint(
+        self,
+        *,
+        key: bytes,
+        pause_after: bool = True,
+        labels: Mapping[str, str] | None = None,
+    ) -> Checkpoint:
+        """Checkpoint this session's sandbox. See :meth:`SandboxClient.checkpoint`."""
+        return self._client.checkpoint(
+            self.sandbox.name, key=key, pause_after=pause_after, labels=labels
+        )
 
 
 class SandboxClient:
@@ -529,6 +553,108 @@ class SandboxClient:
                 raise SandboxError(f"sandbox {sandbox_name} entered error phase")
             time.sleep(1)
         raise SandboxError(f"sandbox {sandbox_name} was not ready within timeout")
+
+    # -- Checkpoint / pause / resume ------------------------------------------
+    #
+    # Design-first scaffolding for RFC 0011 (checkpoint-pause-resume). The
+    # public signatures are frozen here for review; the bodies stay
+    # NotImplementedError until the gateway RPCs (PauseSandbox, ResumeSandbox,
+    # CheckpointSandbox, RestoreSandbox), the SANDBOX_PHASE_PAUSED lifecycle
+    # state, and per-driver checkpoint capabilities land. See
+    # rfc/0011-checkpoint-pause-resume/README.md.
+
+    def pause(
+        self,
+        sandbox_name: str,
+        *,
+        checkpoint_on_pause: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> SandboxRef:
+        """Suspend a ready sandbox, reclaiming compute while preserving state.
+
+        Intended to be idempotent: pausing an already-paused sandbox is a
+        no-op. Drivers that cannot freeze in place may implement pause via
+        checkpoint-and-stop; ``checkpoint_on_pause`` requests that behavior
+        explicitly.
+
+        Not yet implemented — requires the gateway ``PauseSandbox`` RPC and a
+        driver advertising ``pause_resume_in_place``. See RFC 0011.
+        """
+        raise NotImplementedError(
+            "pause() is not implemented yet; it requires gateway/proto and "
+            "compute-driver support tracked in "
+            "rfc/0011-checkpoint-pause-resume"
+        )
+
+    def resume(
+        self,
+        sandbox_name: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> SandboxRef:
+        """Resume a paused sandbox in place, returning it to ``READY``.
+
+        Intended to be idempotent for an already-ready sandbox.
+
+        Not yet implemented — requires the gateway ``ResumeSandbox`` RPC. See
+        RFC 0011.
+        """
+        raise NotImplementedError(
+            "resume() is not implemented yet; it requires gateway/proto and "
+            "compute-driver support tracked in "
+            "rfc/0011-checkpoint-pause-resume"
+        )
+
+    def checkpoint(
+        self,
+        sandbox_name: str,
+        *,
+        key: bytes,
+        pause_after: bool = True,
+        labels: Mapping[str, str] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> Checkpoint:
+        """Capture sandbox state into a portable, signed ``Checkpoint``.
+
+        The gateway streams the driver-produced state blob; the SDK wraps it in
+        the integrity-protected ``.osckpt`` envelope authenticated with ``key``
+        (see :mod:`openshell.checkpoint`). Persist the result with
+        ``checkpoint.to_bytes(key=key)``.
+
+        Not yet implemented — requires the server-streaming ``CheckpointSandbox``
+        RPC and a driver advertising ``checkpoint_export``. The envelope format
+        it will use is already implemented in :mod:`openshell.checkpoint`. See
+        RFC 0011.
+        """
+        raise NotImplementedError(
+            "checkpoint() is not implemented yet; it requires gateway/proto and "
+            "compute-driver support tracked in rfc/0011-checkpoint-pause-resume. "
+            "The portable checkpoint format is available in openshell.checkpoint."
+        )
+
+    def restore(
+        self,
+        checkpoint: Checkpoint,
+        *,
+        key: bytes,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> SandboxRef:
+        """Create a new sandbox initialized from a previously captured checkpoint.
+
+        The SDK verifies the checkpoint's HMAC/digest under ``key`` before any
+        bytes are streamed to the gateway; a failed check raises
+        :class:`~openshell.checkpoint.CheckpointIntegrityError` and the restore
+        never starts.
+
+        Not yet implemented — requires the client-streaming ``RestoreSandbox``
+        RPC and a driver advertising ``restore_import``. See RFC 0011.
+        """
+        raise NotImplementedError(
+            "restore() is not implemented yet; it requires gateway/proto and "
+            "compute-driver support tracked in rfc/0011-checkpoint-pause-resume. "
+            "The portable checkpoint format is available in openshell.checkpoint."
+        )
 
     def exec_stream(
         self,
@@ -852,6 +978,30 @@ class Sandbox:
             env=env,
             timeout_seconds=timeout_seconds,
         )
+
+    def pause(self, *, checkpoint_on_pause: bool = False) -> SandboxRef:
+        """Suspend the bound sandbox. See :meth:`SandboxClient.pause` (RFC 0011)."""
+        if self._session is None:
+            raise SandboxError("sandbox context has not been entered")
+        return self._session.pause(checkpoint_on_pause=checkpoint_on_pause)
+
+    def resume(self) -> SandboxRef:
+        """Resume the bound sandbox. See :meth:`SandboxClient.resume` (RFC 0011)."""
+        if self._session is None:
+            raise SandboxError("sandbox context has not been entered")
+        return self._session.resume()
+
+    def checkpoint(
+        self,
+        *,
+        key: bytes,
+        pause_after: bool = True,
+        labels: Mapping[str, str] | None = None,
+    ) -> Checkpoint:
+        """Checkpoint the bound sandbox. See :meth:`SandboxClient.checkpoint`."""
+        if self._session is None:
+            raise SandboxError("sandbox context has not been entered")
+        return self._session.checkpoint(key=key, pause_after=pause_after, labels=labels)
 
 
 _PYTHON_CLOUDPICKLE_BOOTSTRAP = (

@@ -5,6 +5,15 @@
 
 from __future__ import annotations
 
+from .checkpoint import (
+    CHECKPOINT_FORMAT_VERSION,
+    Checkpoint,
+    CheckpointError,
+    CheckpointIntegrityError,
+    CheckpointMetadata,
+    pack_checkpoint,
+    unpack_checkpoint,
+)
 from .sandbox import (
     ClusterInferenceConfig,
     ExecChunk,
@@ -27,6 +36,11 @@ except Exception:
     __version__ = "0.0.0"
 
 __all__ = [
+    "CHECKPOINT_FORMAT_VERSION",
+    "Checkpoint",
+    "CheckpointError",
+    "CheckpointIntegrityError",
+    "CheckpointMetadata",
     "ClusterInferenceConfig",
     "ExecChunk",
     "ExecResult",
@@ -39,4 +53,6 @@ __all__ = [
     "SandboxStatusRef",
     "TlsConfig",
     "__version__",
+    "pack_checkpoint",
+    "unpack_checkpoint",
 ]
