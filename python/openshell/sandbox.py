@@ -8,6 +8,7 @@ import contextlib
 import json
 import os
 import pathlib
+import shlex
 import sys
 import tempfile
 import threading
@@ -242,6 +243,67 @@ class SandboxSession:
             workdir=workdir,
             env=env,
             timeout_seconds=timeout_seconds,
+        )
+
+    def read_file(
+        self,
+        remote_path: str,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> bytes:
+        return self._client.read_file(
+            self.sandbox.id, remote_path, timeout_seconds=timeout_seconds
+        )
+
+    def write_file(
+        self,
+        remote_path: str,
+        data: bytes,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        self._client.write_file(
+            self.sandbox.id, remote_path, data, timeout_seconds=timeout_seconds
+        )
+
+    def upload_file(
+        self,
+        local_path: str | os.PathLike[str],
+        remote_path: str,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        self._client.upload_file(
+            self.sandbox.id,
+            local_path,
+            remote_path,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def download_file(
+        self,
+        remote_path: str,
+        local_path: str | os.PathLike[str],
+        *,
+        base_dir: str | os.PathLike[str] | None = None,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        self._client.download_file(
+            self.sandbox.id,
+            remote_path,
+            local_path,
+            base_dir=base_dir,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def list_files(
+        self,
+        remote_dir: str = ".",
+        *,
+        timeout_seconds: int | None = None,
+    ) -> builtins.list[str]:
+        return self._client.list_files(
+            self.sandbox.id, remote_dir, timeout_seconds=timeout_seconds
         )
 
     def delete(self) -> bool:
@@ -644,6 +706,142 @@ class SandboxClient:
             timeout_seconds=timeout_seconds,
         )
 
+    def read_file(
+        self,
+        sandbox_id: str,
+        remote_path: str,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> bytes:
+        """Read a file from the sandbox and return its raw bytes.
+
+        Implemented on top of `exec`: the sandbox base64-encodes the
+        file to stdout and the SDK decodes it locally, so binary
+        payloads survive the text-oriented exec stream intact. No
+        gateway/proto changes are required.
+        """
+        result = self.exec(
+            sandbox_id,
+            ["sh", "-c", f"base64 < {shlex.quote(remote_path)}"],
+            timeout_seconds=timeout_seconds,
+        )
+        if result.exit_code != 0:
+            raise SandboxError(
+                f"read_file failed for {remote_path!r} "
+                f"(exit {result.exit_code}): {result.stderr.strip()}"
+            )
+        try:
+            # b64decode ignores the newlines `base64` inserts (non-alphabet
+            # bytes are dropped when validate=False, the default).
+            return base64.b64decode(result.stdout)
+        except ValueError as exc:
+            raise SandboxError(
+                f"read_file received malformed base64 for {remote_path!r}"
+            ) from exc
+
+    def write_file(
+        self,
+        sandbox_id: str,
+        remote_path: str,
+        data: bytes,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        """Write raw bytes to `remote_path`, replacing any existing content.
+
+        The payload is base64-encoded locally and piped to `base64 -d`
+        in the sandbox through exec stdin, so binary data round-trips
+        without a dedicated transfer RPC.
+        """
+        encoded = base64.b64encode(data)
+        result = self.exec(
+            sandbox_id,
+            ["sh", "-c", f"base64 -d > {shlex.quote(remote_path)}"],
+            stdin=encoded,
+            timeout_seconds=timeout_seconds,
+        )
+        if result.exit_code != 0:
+            raise SandboxError(
+                f"write_file failed for {remote_path!r} "
+                f"(exit {result.exit_code}): {result.stderr.strip()}"
+            )
+
+    def upload_file(
+        self,
+        sandbox_id: str,
+        local_path: str | os.PathLike[str],
+        remote_path: str,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        """Upload a local file into the sandbox at `remote_path`.
+
+        Convenience wrapper over `write_file` that reads the local file
+        from disk (`~` expanded). The whole file is buffered in memory
+        and base64-encoded, which is fine for the config-sized payloads
+        this is meant for; very large binaries would be better served by
+        a future dedicated streaming transfer RPC.
+        """
+        source = _resolve_local_path(local_path)
+        if not source.is_file():
+            raise SandboxError(f"upload_file: local file not found: {source}")
+        self.write_file(
+            sandbox_id,
+            remote_path,
+            source.read_bytes(),
+            timeout_seconds=timeout_seconds,
+        )
+
+    def download_file(
+        self,
+        sandbox_id: str,
+        remote_path: str,
+        local_path: str | os.PathLike[str],
+        *,
+        base_dir: str | os.PathLike[str] | None = None,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        """Download a file from the sandbox to `local_path`.
+
+        Convenience wrapper over `read_file` that writes the bytes to
+        the local filesystem, creating parent directories as needed.
+
+        Path safety: when `base_dir` is given, `local_path` is resolved
+        against it and the result must stay inside `base_dir`. This
+        guards the local side against path traversal (`..` segments,
+        absolute paths, symlinked parents) when the destination is
+        derived from an untrusted remote filename. Without `base_dir`
+        the caller-supplied path is used as-is (with `~` expansion).
+        """
+        destination = _resolve_local_path(local_path, base_dir=base_dir)
+        data = self.read_file(sandbox_id, remote_path, timeout_seconds=timeout_seconds)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+
+    def list_files(
+        self,
+        sandbox_id: str,
+        remote_dir: str = ".",
+        *,
+        timeout_seconds: int | None = None,
+    ) -> builtins.list[str]:
+        """List entry names in a sandbox directory (one per line).
+
+        Thin wrapper over `ls -1A`: returns bare entry names (not full
+        paths), includes dotfiles, and omits `.` and `..`.
+        """
+        result = self.exec(
+            sandbox_id,
+            ["sh", "-c", f"ls -1A -- {shlex.quote(remote_dir)}"],
+            timeout_seconds=timeout_seconds,
+        )
+        if result.exit_code != 0:
+            raise SandboxError(
+                f"list_files failed for {remote_dir!r} "
+                f"(exit {result.exit_code}): {result.stderr.strip()}"
+            )
+        return [name for name in result.stdout.splitlines() if name]
+
 
 @dataclass(frozen=True)
 class ClusterInferenceConfig:
@@ -853,6 +1051,67 @@ class Sandbox:
             timeout_seconds=timeout_seconds,
         )
 
+    def read_file(
+        self,
+        remote_path: str,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> bytes:
+        if self._session is None:
+            raise SandboxError("sandbox context has not been entered")
+        return self._session.read_file(remote_path, timeout_seconds=timeout_seconds)
+
+    def write_file(
+        self,
+        remote_path: str,
+        data: bytes,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        if self._session is None:
+            raise SandboxError("sandbox context has not been entered")
+        self._session.write_file(remote_path, data, timeout_seconds=timeout_seconds)
+
+    def upload_file(
+        self,
+        local_path: str | os.PathLike[str],
+        remote_path: str,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        if self._session is None:
+            raise SandboxError("sandbox context has not been entered")
+        self._session.upload_file(
+            local_path, remote_path, timeout_seconds=timeout_seconds
+        )
+
+    def download_file(
+        self,
+        remote_path: str,
+        local_path: str | os.PathLike[str],
+        *,
+        base_dir: str | os.PathLike[str] | None = None,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        if self._session is None:
+            raise SandboxError("sandbox context has not been entered")
+        self._session.download_file(
+            remote_path,
+            local_path,
+            base_dir=base_dir,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def list_files(
+        self,
+        remote_dir: str = ".",
+        *,
+        timeout_seconds: int | None = None,
+    ) -> builtins.list[str]:
+        if self._session is None:
+            raise SandboxError("sandbox context has not been entered")
+        return self._session.list_files(remote_dir, timeout_seconds=timeout_seconds)
+
 
 _PYTHON_CLOUDPICKLE_BOOTSTRAP = (
     "import base64,cloudpickle,os;"
@@ -900,6 +1159,31 @@ def _default_spec() -> openshell_pb2.SandboxSpec:
     # container image and ensures sandboxes get the full dev-sandbox-policy
     # (including network_policies) out of the box.
     return openshell_pb2.SandboxSpec()
+
+
+def _resolve_local_path(
+    local_path: str | os.PathLike[str],
+    *,
+    base_dir: str | os.PathLike[str] | None = None,
+) -> pathlib.Path:
+    """Resolve a local filesystem path for a file transfer.
+
+    With no `base_dir`, expands `~` and otherwise returns the path
+    unchanged. With `base_dir`, resolves `local_path` against it and
+    rejects any result that escapes `base_dir` — the local-side
+    path-traversal guard used by `download_file` when the destination
+    may derive from an untrusted remote filename.
+    """
+    path = pathlib.Path(local_path).expanduser()
+    if base_dir is None:
+        return path
+    base = pathlib.Path(base_dir).expanduser().resolve()
+    resolved = path.resolve() if path.is_absolute() else (base / path).resolve()
+    if not resolved.is_relative_to(base):
+        raise SandboxError(
+            f"refusing to resolve {resolved} outside base directory {base}"
+        )
+    return resolved
 
 
 def _xdg_config_home() -> pathlib.Path:

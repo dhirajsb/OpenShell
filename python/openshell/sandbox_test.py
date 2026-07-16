@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import pickle
+import shlex
 import threading
 import time
 from copy import deepcopy
@@ -25,6 +27,7 @@ from openshell.sandbox import (
     SandboxClient,
     SandboxError,
     SandboxRef,
+    SandboxSession,
     SandboxStatusRef,
     TlsConfig,
     _BearerAuthInterceptor,
@@ -1691,3 +1694,213 @@ def test_high_level_attach_rejects_labels() -> None:
 
     with pytest.raises(SandboxError):
         sandbox.__enter__()
+
+
+# ---------------------------------------------------------------------------
+# File-transfer helpers (upload_file / download_file / read/write/list).
+# Implemented over the exec/stdin primitives (base64 stream) so no gateway
+# or proto change is required.
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedExecStub:
+    """Fake ExecSandbox stub that records requests and replays a scripted
+    stdout/stderr/exit sequence — the file helpers are pure exec wrappers."""
+
+    def __init__(
+        self,
+        *,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        exit_code: int = 0,
+    ) -> None:
+        self.requests: list[openshell_pb2.ExecSandboxRequest] = []
+        self._stdout = stdout
+        self._stderr = stderr
+        self._exit_code = exit_code
+
+    def ExecSandbox(
+        self,
+        request: openshell_pb2.ExecSandboxRequest,
+        timeout: float | None = None,
+    ):
+        self.requests.append(request)
+        _ = timeout
+        if self._stdout:
+            yield openshell_pb2.ExecSandboxEvent(
+                stdout=openshell_pb2.ExecSandboxStdout(data=self._stdout)
+            )
+        if self._stderr:
+            yield openshell_pb2.ExecSandboxEvent(
+                stderr=openshell_pb2.ExecSandboxStderr(data=self._stderr)
+            )
+        yield openshell_pb2.ExecSandboxEvent(
+            exit=openshell_pb2.ExecSandboxExit(exit_code=self._exit_code)
+        )
+
+
+def test_write_file_base64_encodes_payload_over_stdin() -> None:
+    stub = _ScriptedExecStub()
+    client = _client_with_fake_stub(stub)
+
+    payload = b"binary\x00\xff data"
+    client.write_file("sandbox-1", "/work/out.bin", payload)
+
+    assert len(stub.requests) == 1
+    request = stub.requests[0]
+    assert list(request.command) == [
+        "sh",
+        "-c",
+        f"base64 -d > {shlex.quote('/work/out.bin')}",
+    ]
+    # stdin is the base64 of the payload; decoding it recovers the bytes.
+    assert base64.b64decode(request.stdin) == payload
+
+
+def test_write_file_raises_on_nonzero_exit() -> None:
+    stub = _ScriptedExecStub(exit_code=1, stderr=b"Permission denied")
+    client = _client_with_fake_stub(stub)
+
+    with pytest.raises(SandboxError, match=r"write_file failed.*Permission denied"):
+        client.write_file("sandbox-1", "/root/nope", b"x")
+
+
+def test_read_file_decodes_base64_stdout() -> None:
+    payload = b"\x00\x01\x02hello\xff"
+    stub = _ScriptedExecStub(stdout=base64.b64encode(payload))
+    client = _client_with_fake_stub(stub)
+
+    result = client.read_file("sandbox-1", "/work/in.bin")
+
+    assert result == payload
+    assert list(stub.requests[0].command) == [
+        "sh",
+        "-c",
+        f"base64 < {shlex.quote('/work/in.bin')}",
+    ]
+
+
+def test_read_file_tolerates_line_wrapped_base64() -> None:
+    """`base64` wraps output at 76 columns; the newlines must not break
+    decoding (b64decode drops non-alphabet bytes with validate=False)."""
+    payload = b"x" * 200
+    encoded = base64.b64encode(payload)
+    wrapped = b"\n".join(encoded[i : i + 76] for i in range(0, len(encoded), 76))
+    stub = _ScriptedExecStub(stdout=wrapped + b"\n")
+    client = _client_with_fake_stub(stub)
+
+    assert client.read_file("sandbox-1", "/work/big") == payload
+
+
+def test_read_file_raises_on_nonzero_exit() -> None:
+    stub = _ScriptedExecStub(exit_code=1, stderr=b"No such file or directory")
+    client = _client_with_fake_stub(stub)
+
+    with pytest.raises(SandboxError, match=r"read_file failed.*No such file"):
+        client.read_file("sandbox-1", "/missing")
+
+
+def test_upload_file_reads_local_and_streams_bytes(tmp_path: Path) -> None:
+    stub = _ScriptedExecStub()
+    client = _client_with_fake_stub(stub)
+
+    local = tmp_path / "payload.bin"
+    payload = b"local\x00bytes"
+    local.write_bytes(payload)
+
+    client.upload_file("sandbox-1", local, "/work/out.bin")
+
+    assert base64.b64decode(stub.requests[0].stdin) == payload
+
+
+def test_upload_file_raises_when_local_missing(tmp_path: Path) -> None:
+    stub = _ScriptedExecStub()
+    client = _client_with_fake_stub(stub)
+
+    with pytest.raises(SandboxError, match="local file not found"):
+        client.upload_file("sandbox-1", tmp_path / "absent", "/work/out")
+    # Nothing should have been sent to the sandbox.
+    assert stub.requests == []
+
+
+def test_download_file_writes_bytes_locally(tmp_path: Path) -> None:
+    payload = b"\x00downloaded\xfe"
+    stub = _ScriptedExecStub(stdout=base64.b64encode(payload))
+    client = _client_with_fake_stub(stub)
+
+    destination = tmp_path / "nested" / "out.bin"
+    client.download_file("sandbox-1", "/work/in.bin", destination)
+
+    # Parent directories are created on demand.
+    assert destination.read_bytes() == payload
+
+
+def test_download_file_allows_path_within_base_dir(tmp_path: Path) -> None:
+    payload = b"safe"
+    stub = _ScriptedExecStub(stdout=base64.b64encode(payload))
+    client = _client_with_fake_stub(stub)
+
+    client.download_file("sandbox-1", "/work/in.bin", "sub/out.bin", base_dir=tmp_path)
+
+    assert (tmp_path / "sub" / "out.bin").read_bytes() == payload
+
+
+def test_download_file_rejects_path_traversal(tmp_path: Path) -> None:
+    stub = _ScriptedExecStub(stdout=base64.b64encode(b"x"))
+    client = _client_with_fake_stub(stub)
+
+    with pytest.raises(SandboxError, match="outside base directory"):
+        client.download_file(
+            "sandbox-1", "/work/in.bin", "../escape", base_dir=tmp_path
+        )
+    # The traversal is rejected before any exec is issued.
+    assert stub.requests == []
+
+
+def test_download_file_rejects_absolute_path_outside_base_dir(
+    tmp_path: Path,
+) -> None:
+    stub = _ScriptedExecStub(stdout=base64.b64encode(b"x"))
+    client = _client_with_fake_stub(stub)
+
+    with pytest.raises(SandboxError, match="outside base directory"):
+        client.download_file(
+            "sandbox-1", "/work/in.bin", "/etc/passwd", base_dir=tmp_path
+        )
+
+
+def test_list_files_parses_entry_names() -> None:
+    stub = _ScriptedExecStub(stdout=b"a.txt\nb.txt\n.hidden\n\n")
+    client = _client_with_fake_stub(stub)
+
+    entries = client.list_files("sandbox-1", "/work")
+
+    assert entries == ["a.txt", "b.txt", ".hidden"]
+    assert list(stub.requests[0].command) == [
+        "sh",
+        "-c",
+        f"ls -1A -- {shlex.quote('/work')}",
+    ]
+
+
+def test_list_files_raises_on_nonzero_exit() -> None:
+    stub = _ScriptedExecStub(exit_code=2, stderr=b"cannot access")
+    client = _client_with_fake_stub(stub)
+
+    with pytest.raises(SandboxError, match=r"list_files failed.*cannot access"):
+        client.list_files("sandbox-1", "/missing")
+
+
+def test_session_file_ops_forward_sandbox_id() -> None:
+    stub = _ScriptedExecStub()
+    client = _client_with_fake_stub(stub)
+    ref = SandboxRef(
+        id="sandbox-42",
+        name="job-1",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+    session = SandboxSession(client, ref)
+
+    session.write_file("/work/out", b"data")
+
+    assert stub.requests[0].sandbox_id == "sandbox-42"
