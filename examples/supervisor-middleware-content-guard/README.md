@@ -38,6 +38,8 @@ The `http://` gRPC endpoint uses plaintext without peer authentication.
 
 The service manifest describes its supported operation and phase. The policy attaches the complete service by the operator-owned `content-guard-example` registration name, not by the diagnostic manifest name.
 
+The `network_middlewares` map key `prototype-content-guard` is the stable policy-local identity. The optional `name` field is a human-readable label, and `order` must be unique across every middleware config in the policy.
+
 ## Apply the example policy
 
 The included policy allows `curl` to POST to `https://httpbin.org/anything` and replaces `prototype-secret` or `internal-only` in the request body:
