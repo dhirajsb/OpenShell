@@ -39,6 +39,14 @@ classifiers = [
 ]
 keywords = ["agent", "sandbox", "nvidia"]
 
+[project.optional-dependencies]
+# LangChain tool factories (openshell.langchain). Opt-in extra; the
+# module imports without these installed and raises a clear error only
+# when a tool factory is called. Install with: pip install "openshell[langchain]"
+langchain = [
+    "langchain-core>=0.3",
+]
+
 [project.urls]
 source = "https://github.com/NVIDIA/OpenShell"
 documentation = "https://docs.nvidia.com/openshell/latest/"
