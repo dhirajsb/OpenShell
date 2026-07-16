@@ -11,7 +11,7 @@ Supervisor middleware is a research preview. Its policy and service contracts ma
 </Warning>
 <!-- markdownlint-enable MD033 -->
 
-This example implements the `example/content-guard` supervisor middleware binding. It scans UTF-8 HTTP request bodies for configured literal strings, then either replaces every match or denies the request. Findings report only aggregate counts and never include configured terms or request content.
+This example implements an operator-run supervisor middleware service. It scans UTF-8 HTTP request bodies for configured literal strings, then either replaces every match or denies the request. Findings report only aggregate counts and never include configured terms or request content.
 
 ## Run the service
 
@@ -35,6 +35,8 @@ timeout = "500ms"
 The gateway calls `Describe` during startup and fails to start if the service is unavailable. Both the gateway and sandbox supervisors must resolve and reach the configured endpoint. Change the hostname when `host.openshell.internal` is not the shared host address for your local driver.
 
 The `http://` gRPC endpoint uses plaintext without peer authentication.
+
+The service manifest describes its supported operation and phase. The policy attaches the complete service by the operator-owned `content-guard-example` registration name, not by the diagnostic manifest name.
 
 ## Apply the example policy
 

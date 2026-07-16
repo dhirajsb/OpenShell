@@ -18,7 +18,7 @@ use prost_types::value::Kind;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
-const BINDING_ID: &str = "example/content-guard";
+const MANIFEST_NAME: &str = "example/content-guard-service";
 const OPERATION: SupervisorMiddlewareOperation = SupervisorMiddlewareOperation::HttpRequest;
 const PHASE: SupervisorMiddlewarePhase = SupervisorMiddlewarePhase::PreCredentials;
 const MAX_BODY_BYTES: u64 = 256 * 1024;
@@ -119,10 +119,9 @@ impl SupervisorMiddleware for ContentGuard {
         _request: Request<()>,
     ) -> Result<Response<MiddlewareManifest>, Status> {
         Ok(Response::new(MiddlewareManifest {
-            name: "example/content-guard-service".into(),
+            name: MANIFEST_NAME.into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
             bindings: vec![MiddlewareBinding {
-                id: BINDING_ID.into(),
                 operation: OPERATION as i32,
                 phase: PHASE as i32,
                 max_body_bytes: MAX_BODY_BYTES,
@@ -136,8 +135,7 @@ impl SupervisorMiddleware for ContentGuard {
         request: Request<ValidateConfigRequest>,
     ) -> Result<Response<ValidateConfigResponse>, Status> {
         let request = request.into_inner();
-        let validation = validate_envelope(&request.binding_id, None)
-            .and_then(|()| GuardConfig::parse(request.config.as_ref()));
+        let validation = GuardConfig::parse(request.config.as_ref());
         Ok(Response::new(match validation {
             Ok(_) => ValidateConfigResponse {
                 valid: true,
@@ -155,8 +153,7 @@ impl SupervisorMiddleware for ContentGuard {
         request: Request<HttpRequestEvaluation>,
     ) -> Result<Response<HttpRequestResult>, Status> {
         let request = request.into_inner();
-        validate_envelope(&request.binding_id, Some(&request.phase))
-            .map_err(Status::invalid_argument)?;
+        validate_phase(request.phase).map_err(Status::invalid_argument)?;
         let config =
             GuardConfig::parse(request.config.as_ref()).map_err(Status::invalid_argument)?;
         let body = String::from_utf8(request.body)
@@ -165,13 +162,8 @@ impl SupervisorMiddleware for ContentGuard {
     }
 }
 
-fn validate_envelope(binding_id: &str, phase: Option<&i32>) -> Result<(), String> {
-    if binding_id != BINDING_ID {
-        return Err(format!("unsupported binding_id '{binding_id}'"));
-    }
-    if let Some(phase) = phase
-        && *phase != PHASE as i32
-    {
+fn validate_phase(phase: i32) -> Result<(), String> {
+    if phase != PHASE as i32 {
         return Err(format!("unsupported phase '{phase}'"));
     }
     Ok(())
@@ -253,7 +245,7 @@ fn allow_result() -> HttpRequestResult {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    println!("serving {BINDING_ID} on http://{}", cli.bind);
+    println!("serving {MANIFEST_NAME} on http://{}", cli.bind);
     Server::builder()
         .add_service(SupervisorMiddlewareServer::new(ContentGuard))
         .serve(cli.bind)
