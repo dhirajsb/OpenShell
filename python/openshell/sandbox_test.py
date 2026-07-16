@@ -25,6 +25,7 @@ from openshell.sandbox import (
     SandboxClient,
     SandboxError,
     SandboxRef,
+    SandboxSession,
     SandboxStatusRef,
     TlsConfig,
     _BearerAuthInterceptor,
@@ -105,6 +106,65 @@ def test_exec_python_serializes_callable_payload() -> None:
     ]
     assert stub.request.environment["OPENSHELL_PYFUNC_B64"]
     assert stub.request.stdin == b""
+
+
+def test_execute_runs_python_source_snippet() -> None:
+    stub = _FakeStub()
+    client = _client_with_fake_stub(stub)
+
+    result = client.execute("sandbox-1", "print('hello')")
+
+    assert result.exit_code == 0
+    assert stub.request is not None
+    assert stub.request.command == [_SANDBOX_PYTHON_BIN, "-c", "print('hello')"]
+    # Unlike exec_python, execute ships the source verbatim — no cloudpickle
+    # payload is injected into the environment.
+    assert "OPENSHELL_PYFUNC_B64" not in stub.request.environment
+    assert stub.request.stdin == b""
+
+
+def test_execute_forwards_workdir_env_and_timeout() -> None:
+    stub = _FakeStub()
+    client = _client_with_fake_stub(stub)
+
+    client.execute(
+        "sandbox-1",
+        "print('ok')",
+        workdir="/work",
+        env={"FOO": "bar"},
+        timeout_seconds=5,
+    )
+
+    assert stub.request is not None
+    assert stub.request.workdir == "/work"
+    assert dict(stub.request.environment) == {"FOO": "bar"}
+    assert stub.request.timeout_seconds == 5
+
+
+def test_session_execute_forwards_to_client() -> None:
+    stub = _FakeStub()
+    client = _client_with_fake_stub(stub)
+    session = SandboxSession(
+        client,
+        SandboxRef(
+            id="sandbox-1",
+            name="job-1",
+            status=SandboxStatusRef(phase=2, current_policy_version=0),
+        ),
+    )
+
+    result = session.execute("print('hi')")
+
+    assert result.exit_code == 0
+    assert stub.request is not None
+    assert stub.request.command == [_SANDBOX_PYTHON_BIN, "-c", "print('hi')"]
+
+
+def test_high_level_execute_raises_before_context_entered() -> None:
+    sandbox = Sandbox()
+
+    with pytest.raises(SandboxError):
+        sandbox.execute("print('x')")
 
 
 def test_from_active_cluster_reads_gateway_metadata_layout(

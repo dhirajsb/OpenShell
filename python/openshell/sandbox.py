@@ -244,6 +244,24 @@ class SandboxSession:
             timeout_seconds=timeout_seconds,
         )
 
+    def execute(
+        self,
+        code: str,
+        *,
+        stream_output: bool = False,
+        workdir: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout_seconds: int | None = None,
+    ) -> ExecResult:
+        return self._client.execute(
+            self.sandbox.id,
+            code,
+            stream_output=stream_output,
+            workdir=workdir,
+            env=env,
+            timeout_seconds=timeout_seconds,
+        )
+
     def delete(self) -> bool:
         return self._client.delete(self.sandbox.name)
 
@@ -644,6 +662,46 @@ class SandboxClient:
             timeout_seconds=timeout_seconds,
         )
 
+    def execute(
+        self,
+        sandbox_id: str,
+        code: str,
+        *,
+        stream_output: bool = False,
+        workdir: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout_seconds: int | None = None,
+    ) -> ExecResult:
+        """Run a Python source snippet in the sandbox.
+
+        High-level helper over `exec`: runs `code` with the sandbox's
+        Python interpreter (equivalent to `python -c <code>`) and
+        returns the captured `ExecResult` (exit code, stdout, stderr).
+
+        Unlike `exec_python`, which serializes a local callable with
+        cloudpickle and executes it, `execute` ships a source string
+        as-is. That makes it the ergonomic choice for quick snippets,
+        model- or template-generated code, or REPL-style evaluation
+        where you already hold Python source rather than a callable.
+
+        Args:
+            sandbox_id: target sandbox id.
+            code: Python source to execute (passed to `python -c`).
+            stream_output: mirror stdout/stderr to the local process as
+                the command runs, in addition to capturing them.
+            workdir: working directory inside the sandbox.
+            env: extra environment variables for the interpreter process.
+            timeout_seconds: per-command timeout inside the sandbox.
+        """
+        return self.exec(
+            sandbox_id,
+            [_SANDBOX_PYTHON_BIN, "-c", code],
+            stream_output=stream_output,
+            workdir=workdir,
+            env=env,
+            timeout_seconds=timeout_seconds,
+        )
+
 
 @dataclass(frozen=True)
 class ClusterInferenceConfig:
@@ -847,6 +905,25 @@ class Sandbox:
             function,
             args=args,
             kwargs=kwargs,
+            stream_output=stream_output,
+            workdir=workdir,
+            env=env,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def execute(
+        self,
+        code: str,
+        *,
+        stream_output: bool = False,
+        workdir: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout_seconds: int | None = None,
+    ) -> ExecResult:
+        if self._session is None:
+            raise SandboxError("sandbox context has not been entered")
+        return self._session.execute(
+            code,
             stream_output=stream_output,
             workdir=workdir,
             env=env,
