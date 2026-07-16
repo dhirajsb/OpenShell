@@ -26,6 +26,7 @@ from ._proto import (
     openshell_pb2,
     openshell_pb2_grpc,
 )
+from .spec import SandboxSpec
 
 _ClientCallDetailsBase = namedtuple(
     "_ClientCallDetailsBase",
@@ -427,11 +428,18 @@ class SandboxClient:
     def create(
         self,
         *,
-        spec: openshell_pb2.SandboxSpec | None = None,
+        spec: openshell_pb2.SandboxSpec | SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
     ) -> SandboxRef:
-        request_spec = spec if spec is not None else _default_spec()
+        # Accept either the typed `spec.SandboxSpec` model or a raw protobuf
+        # message so callers don't have to hand-build protobuf objects.
+        if spec is None:
+            request_spec = _default_spec()
+        elif isinstance(spec, SandboxSpec):
+            request_spec = spec.to_proto()
+        else:
+            request_spec = spec
         response = self._stub.CreateSandbox(
             openshell_pb2.CreateSandboxRequest(
                 spec=request_spec,
@@ -448,7 +456,7 @@ class SandboxClient:
     def create_session(
         self,
         *,
-        spec: openshell_pb2.SandboxSpec | None = None,
+        spec: openshell_pb2.SandboxSpec | SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
     ) -> SandboxSession:
@@ -705,7 +713,7 @@ class Sandbox:
         cluster: str | None = None,
         sandbox: str | SandboxRef | None = None,
         delete_on_exit: bool = True,
-        spec: openshell_pb2.SandboxSpec | None = None,
+        spec: openshell_pb2.SandboxSpec | SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         timeout: float = 30.0,

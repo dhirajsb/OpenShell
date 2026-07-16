@@ -18,6 +18,12 @@ from .sandbox import (
     SandboxStatusRef,
     TlsConfig,
 )
+from .spec import (
+    GpuRequirements,
+    ResourceRequirements,
+    SandboxSpec,
+    SandboxTemplate,
+)
 
 try:
     from importlib.metadata import version
@@ -30,13 +36,17 @@ __all__ = [
     "ClusterInferenceConfig",
     "ExecChunk",
     "ExecResult",
+    "GpuRequirements",
     "InferenceRouteClient",
+    "ResourceRequirements",
     "Sandbox",
     "SandboxClient",
     "SandboxError",
     "SandboxRef",
     "SandboxSession",
+    "SandboxSpec",
     "SandboxStatusRef",
+    "SandboxTemplate",
     "TlsConfig",
     "__version__",
 ]
