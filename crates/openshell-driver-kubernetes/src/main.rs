@@ -134,6 +134,7 @@ async fn main() -> Result<()> {
 
     let driver = KubernetesComputeDriver::new(KubernetesComputeConfig {
         namespace: args.sandbox_namespace,
+        workspace_namespaces: Default::default(),
         service_account_name: args.sandbox_service_account,
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),

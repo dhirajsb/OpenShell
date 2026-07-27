@@ -9,6 +9,11 @@ Edit README.md.gotmpl and values.yaml, then run `mise run helm:docs`.
 
 This chart deploys the OpenShell gateway into a Kubernetes cluster. It is published as an OCI artifact to GHCR at `oci://ghcr.io/nvidia/openshell/helm-chart`.
 
+To route logical workspaces to pre-provisioned namespaces, set
+`server.workspaceNamespaces`. The gateway fails closed for unmapped workspaces
+and requires its namespaced RBAC, sandbox ServiceAccount, and referenced
+Secrets in every mapped namespace.
+
 ## Prerequisites
 
 The Kubernetes Agent Sandbox CRDs and controller must be installed on the cluster before deploying OpenShell. Install them with:
@@ -229,6 +234,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead). |
 | server.tls.clientTlsSecretName | string | `"openshell-client-tls"` | K8s secret mounted into sandbox pods for mTLS to the server. |
 | server.workspaceDefaultStorageSize | string | `""` | Default storage size for the workspace PVC in sandbox pods. Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi"). Empty = built-in default (2Gi). |
+| server.workspaceNamespaces | object | `{}` | Optional map from logical OpenShell workspace names to pre-provisioned Kubernetes namespaces. When non-empty, sandbox creation fails for an unmapped workspace and lifecycle operations are limited to these namespaces. Empty preserves server.sandboxNamespace behavior. |
 | service.healthPort | int | `8081` | Gateway health service port. |
 | service.metricsPort | int | `9090` | Gateway metrics service port. |
 | service.port | int | `8080` | Gateway gRPC/HTTP service port. |
