@@ -1806,6 +1806,9 @@ pub(super) async fn handle_create_provider(
         metadata.workspace.clone_from(&workspace);
     }
     let provider_type = provider.r#type.clone();
+    if state.credentials.stores_provider_credentials() && !provider.credentials.is_empty() {
+        state.compute.ensure_workspace(&workspace).await?;
+    }
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -2918,6 +2921,9 @@ pub(super) async fn handle_update_provider(
     provider
         .credential_expires_at_ms
         .extend(req.credential_expires_at_ms);
+    if state.credentials.stores_provider_credentials() && !provider.credentials.is_empty() {
+        state.compute.ensure_workspace(&workspace).await?;
+    }
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -3333,6 +3339,7 @@ pub(super) async fn handle_rotate_provider_credential(
         state.store.as_ref(),
         &workspace,
         Some(&state.credentials),
+        Some(&state.compute),
         provider_name,
         credential_key,
     )
